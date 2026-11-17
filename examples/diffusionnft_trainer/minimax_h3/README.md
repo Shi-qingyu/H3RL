@@ -9,7 +9,7 @@ trained with FSDP2 while vLLM-Omni generates joint video and audio rollouts.
 CLAP and ImageBind provide the default multi-reward (audio-video alignment).
 
 For source-video editing with a three-head VideoReward checkpoint, see the
-[video-editing recipe](README_video_edit.md).
+[video-editing recipe](https://github.com/Shi-qingyu/H3RL/blob/main/examples/diffusionnft_trainer/minimax_h3/README_video_edit.md).
 
 A ready-made FL2VA first-frame dataset built with the data pipeline below is
 published at https://huggingface.co/datasets/zyfenghit/dancegrpo-t2av

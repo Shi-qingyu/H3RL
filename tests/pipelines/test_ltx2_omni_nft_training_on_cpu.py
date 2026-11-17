@@ -120,7 +120,7 @@ def _engine(monkeypatch, num_train_timesteps=1000):
     engine.use_ulysses_sp = False
     engine.ulysses_sequence_parallel_size = 1
     engine.module = _Policies()
-    engine.use_adapter = lambda name: engine.module.select("old" if name == "old" else "current")
+    engine.use_adapter = lambda name: engine.module.select("current" if name == "default" else name)
     engine.disable_adapter = lambda: engine.module.select("reference")
     engine._set_adapter = Mock()
     engine.get_data_parallel_group = lambda: None
