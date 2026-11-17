@@ -1,0 +1,82 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Shared helpers for agent-loop rollout seeding (diffusion + composite loops).
+
+``ImageGenToolAgentLoop`` helpers are in ``verl_omni.tools.agent_helper.image_gen_utils``,
+not here, so diffusion loops do not import Hydra ``agentic_image_gen`` readers.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Optional
+
+__all__ = [
+    "derive_rollout_seed",
+    "maybe_per_rollout_seeds",
+    "messages_to_text",
+]
+
+
+def messages_to_text(messages: Any) -> str:
+    """Extract message text without applying a chat template."""
+    if isinstance(messages, str):
+        return messages
+    if isinstance(messages, dict):
+        messages = [messages]
+
+    parts = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content", "")
+        if isinstance(content, str):
+            parts.append(content)
+            continue
+        for item in content or []:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("type") == "text":
+                parts.append(item.get("text", ""))
+    return "\n".join(part for part in parts if part).strip()
+
+
+def derive_rollout_seed(base_seed: int, rollout_index: int) -> int:
+    """Map per-step rollout base and expanded row index to a vLLM seed.
+    Row index is 0 .. num_prompts * rollout.n - 1 after interleaved repeat."""
+    max_seed = (1 << 63) - 1
+    return (int(base_seed) * 1_000_003 + int(rollout_index)) % max_seed
+
+
+def maybe_per_rollout_seeds(meta_info: dict, batch_size: int, global_indices=None) -> Optional[list[int]]:
+    """Build one seed per post-repeat rollout row.
+
+    When ``global_indices`` is provided (trainer sets ``_rollout_seed_global_idx``),
+    seeds are derived from those stable indices rather than the local chunk
+    position, so multi-worker splits and request packing order cannot remap RNG
+    state across rows.
+    """
+    base = meta_info.get("rollout_seed")
+    if base is None:
+        return None
+    base = int(base)
+
+    if global_indices is None:
+        return [derive_rollout_seed(base, i) for i in range(batch_size)]
+
+    indices = [int(idx) for idx in list(global_indices)]
+    if len(indices) != batch_size:
+        raise ValueError(f"Expected {batch_size} global rollout indices, got {len(indices)}")
+
+    return [derive_rollout_seed(base, idx) for idx in indices]

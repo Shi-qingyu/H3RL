@@ -1,0 +1,57 @@
+# CODEOWNERS for verl-project/verl-omni
+#
+# Used to automatically request PR reviewers.
+# Format: <pattern> @username [@username ...]
+# See https://docs.github.com/articles/about-code-owners
+#
+# Derived from the module table in docs/community/governance.md.
+# When updating ownership, update governance.md first, then the matching
+# rule here.
+#
+# Last-match-wins: more specific rules must come AFTER broader ones.
+# Being listed here does not grant committer status or merge rights.
+
+# Default owner for unmatched paths
+* @samithuang @zhtmike
+
+# Tests, CI, packaging, environment, and documentation
+/.github/ @wtomin
+/docker/ @wtomin
+/tests/ @wtomin
+/docs/ @wtomin
+/scripts/ @wtomin
+/.agents/ @wtomin
+
+# Datasets and examples
+/examples/ @chenyingshu @NancyFyong
+/verl_omni/utils/dataset/ @chenyingshu @NancyFyong
+
+# Trainer and algorithm core
+/verl_omni/trainer/ @chenyingshu @NancyFyong @WenzheWang
+
+# Workers and training engines (FSDP/VeOmni, actor/ref, LoRA, checkpointing)
+/verl_omni/workers/ @cr-gao @zhtmike
+
+# Rollout and agent loop (overrides workers/rollout)
+/verl_omni/agent_loop/ @knlnguyen1802 @Sky-Trigger @NancyFyong @ZihaoW123
+/verl_omni/workers/rollout/ @knlnguyen1802 @Sky-Trigger @NancyFyong @ZihaoW123
+/verl_omni/utils/vllm_omni/ @knlnguyen1802 @Sky-Trigger @NancyFyong @ZihaoW123
+
+# Reward system
+/verl_omni/reward_loop/ @ruihanglix @chenyingshu @Sky-Trigger @ZihaoW123
+/verl_omni/utils/reward_score/ @ruihanglix @chenyingshu @Sky-Trigger @ZihaoW123
+
+# Pipeline and model adaptation
+/verl_omni/pipelines/ @chenyingshu @NancyFyong @ZihaoW123 @knlnguyen1802
+
+# Ascend NPU adaptation (overrides docker/, .github/, tests/, and docs/)
+/docker/*.npu @mengchengTang
+/.github/workflows/*npu* @mengchengTang
+/tests/*npu*/ @mengchengTang
+/docs/**/*npu*.md @mengchengTang
+
+# Profiling and observability (overrides docs/ and .agents/)
+/docs/perf/ @mengchengTang
+**/rl_insight.* @mengchengTang
+/.agents/skills/profile/ @mengchengTang
+/.agents/skills/train-infer-consistency/ @mengchengTang

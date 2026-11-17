@@ -1,0 +1,601 @@
+# Profiling FlowGRPO / diffusion training in VeRL-Omni
+
+Last updated: 10/24/2026.
+
+VeRL-Omni reuses the profiler subsystem from upstream
+[verl](https://github.com/verl-project/verl) (`verl.utils.profiler`) and exposes
+the same configuration surface for the diffusion trainer. Four profiling tools
+are supported:
+
+| Tool          | Backend                                    | Use case                                  |
+|---------------|--------------------------------------------|-------------------------------------------|
+| `nsys`        | NVIDIA Nsight Systems                      | End-to-end CUDA / kernel timeline tracing |
+| `npu`        | Ascend NPU profiler                       | NPU / CPU operator and memory profiling  |
+| `torch`       | `torch.profiler`                           | PyTorch-level CPU / CUDA / op profiling   |
+| `torch_memory`| `torch.cuda.memory._dump_snapshot`         | CUDA memory allocation snapshots          |
+
+## Configuration overview
+
+Profiling is controlled by two layers of configuration that mirror upstream
+verl conventions:
+
+1. **Global** profiler config under `global_profiler` in
+   [`diffusion_trainer.yaml`](https://github.com/verl-project/verl-omni/blob/main/verl_omni/trainer/config/diffusion_trainer.yaml).
+   Selects the tool, the steps to profile, the output directory, and global
+   tool-specific options (e.g. nsys controller / worker options).
+2. **Per-role** profiler config under `actor_rollout_ref.{actor,ref,rollout}.profiler`.
+   Inherits defaults from
+   [`profiler/profiler.yaml`](https://github.com/verl-project/verl-omni/blob/main/verl_omni/trainer/config/profiler/profiler.yaml)
+   and selects which ranks to profile and the role-local tool config.
+
+Trainers automatically start and stop collection for steps selected by the
+global `steps` list. Diffusion V1 places these calls around `step()`, following
+the upstream V1 trainer structure. Non-continuous windows therefore exclude
+the subsequent checkpoint, weight-sync, and validation phases.
+
+### Global profiler fields
+
+```yaml
+global_profiler:
+  _target_: verl.utils.profiler.ProfilerConfig
+  tool: null                     # one of: nsys, npu, torch, torch_memory (null disables)
+  steps: null                    # e.g. [1, 2, 5]
+  profile_continuous_steps: False
+  save_path: outputs/profile
+  relocate_results: False
+  finish_hook_cmd: null
+  finish_hook_all_ranks: False
+  finish_hook_ranks: []
+  global_tool_config:
+    nsys: { ... }                # see below
+    torch_memory: { ... }
+```
+
+The following optional fields control result relocation and finish commands.
+
+| Field | Default | Purpose |
+| --- | --- | --- |
+| `relocate_results` | `False` | Gather supported backend artifacts into `save_path` when collection stops. |
+| `finish_hook_cmd` | `null` | Optional shell command for training workers to run after profiling finishes. `null` disables the command. |
+| `finish_hook_all_ranks` | `False` | Run the finish command on every profiled rank when enabled. |
+| `finish_hook_ranks` | `[]` | Explicit profiled ranks on which to run the finish command. |
+
+### Per-role profiler fields
+
+```yaml
+actor_rollout_ref:
+  actor:
+    profiler:
+      tool: torch                # nsys, npu, torch, torch_memory
+      enable: False
+      all_ranks: False
+      ranks: []
+      tool_config:
+        npu:
+          contents: []           # npu, cpu, memory, shapes, module, stack
+          level: level0
+          analysis: True
+          discrete: False
+          profile_token_start: null
+          profile_token_end: null
+        nsys: { discrete: ... }
+        torch:
+          contents: []           # cuda, cpu, memory, shapes, stack
+          discrete: False
+        torch_memory:
+          trace_alloc_max_entries: 100000
+          stack_depth: 32
+```
+
+The same block exists under `actor_rollout_ref.ref.profiler` and
+`actor_rollout_ref.rollout.profiler`. Generation runs in separate vLLM-Omni
+server processes, not in the actor worker, so it has its own profiler driven
+by `actor_rollout_ref.rollout.profiler` (see recipe 5).
+
+Global values for `save_path`, `relocate_results`, and `finish_hook_*` provide
+defaults for the per-role configs. Set a field under
+`actor_rollout_ref.actor.profiler.<field>` to override it for the actor.
+For example, `global_profiler.relocate_results=True` enables result relocation
+for roles inheriting that value; an actor override of `False` disables it
+for the actor only.
+
+To configure an actor-only finish command, set
+`actor_rollout_ref.actor.profiler.finish_hook_cmd` and
+`actor_rollout_ref.actor.profiler.finish_hook_ranks='[0]'`. Rank 0 must also
+be selected for actor profiling. See [Implementation notes](#implementation-notes)
+for finish-command timing.
+
+All the profiler keys below already exist in the composed config, so use
+plain `key=value` overrides — a `+key=value` append fails with "An item is
+already at ...".
+
+## Quick recipes
+
+The following GPU recipes add CLI overrides on top of
+`examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_lora.sh`.
+The PyTorch actor and rollout options also apply to diffusion V1 GPU launchers
+in `sync` and `separate_async` modes.
+
+### 1. PyTorch profiler — end-to-end
+
+Capture a single trace per profiled step (combined CPU + CUDA activities).
+
+```bash
+global_profiler.tool=torch \
+global_profiler.steps=[1,2,5] \
+global_profiler.save_path=./outputs/profile \
+actor_rollout_ref.actor.profiler.enable=True \
+actor_rollout_ref.actor.profiler.all_ranks=True \
+actor_rollout_ref.actor.profiler.tool=torch \
+actor_rollout_ref.actor.profiler.tool_config.torch.contents=[cpu,cuda] \
+actor_rollout_ref.actor.profiler.tool_config.torch.discrete=False
+```
+
+The traces land under `outputs/profile`. View them in
+[Perfetto UI](https://ui.perfetto.dev/) or `chrome://tracing`.
+
+### 2. PyTorch profiler — discrete (per-stage)
+
+Discrete mode produces one database per `@DistProfiler.annotate`-decorated
+function within a step, which is useful when zooming into a specific phase.
+
+```bash
+global_profiler.tool=torch \
+global_profiler.steps=[3] \
+actor_rollout_ref.actor.profiler.enable=True \
+actor_rollout_ref.actor.profiler.ranks=[0] \
+actor_rollout_ref.actor.profiler.tool=torch \
+actor_rollout_ref.actor.profiler.tool_config.torch.discrete=True \
+actor_rollout_ref.actor.profiler.tool_config.torch.contents=[cpu,cuda]
+```
+
+### 3. CUDA memory snapshots (`torch_memory`)
+
+The `torch_memory` tool records allocation history and dumps a snapshot at the
+end of each profiled step. Visualize the resulting JSON files at
+[pytorch.org/memory_viz](https://pytorch.org/memory_viz).
+
+```bash
+global_profiler.tool=torch_memory \
+global_profiler.steps=[1,2] \
+actor_rollout_ref.actor.profiler.enable=True \
+actor_rollout_ref.actor.profiler.all_ranks=True \
+actor_rollout_ref.actor.profiler.tool=torch_memory
+```
+
+### 4. NVIDIA Nsight Systems (`nsys`)
+
+Nsight requires `nsys` to be installed on every node and the `nvtx` Python
+package available in the training environment (`pip install nvtx`).
+
+```bash
+global_profiler.tool=nsys \
+global_profiler.steps=[1,2] \
+global_profiler.profile_continuous_steps=True \
+actor_rollout_ref.actor.profiler.enable=True \
+actor_rollout_ref.actor.profiler.all_ranks=True \
+actor_rollout_ref.actor.profiler.tool=nsys
+```
+
+When `global_profiler.tool=nsys` and `steps` is non-empty, the legacy FlowGRPO
+entrypoint (`python -m verl_omni.trainer.main_diffusion`) launches the Ray
+TaskRunner under `nsys` using the `controller_nsight_options` from
+`global_profiler.global_tool_config.nsys`.
+Workers use `capture-range: cudaProfilerApi`, and the trainer starts and stops
+their collection around the configured steps. The controller records the full
+TaskRunner lifetime when its Nsight options do not specify a capture range. To
+restrict controller collection to the configured steps, add these options:
+
+```bash
++global_profiler.global_tool_config.nsys.controller_nsight_options.capture-range=cudaProfilerApi \
++global_profiler.global_tool_config.nsys.controller_nsight_options.capture-range-end=null \
++global_profiler.global_tool_config.nsys.controller_nsight_options.kill=none
+```
+
+When controller `capture-range-end` is null, it is resolved to the number of
+discrete profiled steps or contiguous step groups before Ray starts the
+TaskRunner.
+
+Diffusion V1 profiling has been validated with the NPU and PyTorch
+(`tool=torch`) backends. Nsight (`tool=nsys`) is unverified for V1. V1 does
+not implement controller capture start/stop calls, so controller
+`capture-range=cudaProfilerApi` is rejected when Nsight profiling steps are
+configured. This restriction does not apply to worker-side capture settings.
+
+`*.nsys-rep` files are written by Ray under
+`/tmp/ray/session_latest/logs/nsight/` on each node (this path is fixed by
+Ray). Open them with `nsys-ui`.
+
+### 4a. Continuous `old_log_prob` and `update_actor` timeline
+
+Use the dedicated Qwen-Image recipe to inspect Python control flow while the
+controller waits for old-log-prob inference or an actor update:
+
+```bash
+bash examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_fsdp2_benchmark_nsys.sh
+```
+
+The default run trains for three steps and captures them in one continuous
+window. Step 2 is the best steady-state sample: step 1 includes profiler
+startup, while step 3 closes the capture. The recipe profiles the Ray
+`TaskRunner` and ActorRollout rank 0 with Python stack sampling and NVTX. Set
+`PROFILE_RANKS=all` only for a follow-up rank-straggler investigation. The
+controller and actor workers each use one CUDA-profiler start/stop pair around
+the same continuous window.
+
+The recipe uses 20 Hz Python stack sampling. Python GIL events, OS-runtime
+events, native CPU sampling, and context-switch events remain disabled to keep
+the diagnostic focused and low overhead.
+
+Although the recipe sets `trace="nvtx"`, `capture-range=cudaProfilerApi`
+requires CUDA tracing for `cudaProfilerStart` and `cudaProfilerStop`. Nsight
+Systems therefore enables CUDA tracing automatically for both the controller
+and workers. The GUI only shows **CUDA API** and **CUDA HW** tracks when the
+report contains corresponding CUDA activity. The controller in the example
+below has no such tracks, while the worker does. Setting
+`cuda-memory-usage=false`, `sample=none`, or `cpuctxsw=none` does not disable
+CUDA tracing; those options disable CUDA memory-usage tracking, native CPU
+sampling, and context-switch tracing, respectively.
+
+The following screenshot shows aligned controller and worker reports from an
+example capture:
+
+![Aligned Nsight Systems controller and worker timelines](../assets/nsys_controller_actor_timeline.png)
+
+In the controller process:
+
+- **NVTX** ranges show the duration of each training phase.
+- **Python Backtrace** shows individual sampling points after zooming in on the
+  timeline. Hover over a sampling point to see its captured Python call stack.
+
+The worker process has the same **NVTX** and **Python Backtrace** information.
+It also has these tracks:
+
+- Expand **CUDA HW** with the triangle on the left, then zoom in to see the
+  kernels executed on each CUDA stream.
+- Zoom in on **CUDA API** to see each host-side CUDA API call.
+
+> [!WARNING]
+> The recipe does not set `discard-environment` because the option is not
+> available in every Nsight Systems release. If your version supports it, you
+> can set it to `true` for both the controller and workers:
+>
+> ```bash
+> +global_profiler.global_tool_config.nsys.controller_nsight_options.discard-environment='"true"' \
+> +global_profiler.global_tool_config.nsys.worker_nsight_options.discard-environment='"true"'
+> ```
+>
+> Without this option, reports may contain environment variables such as
+> `HF_TOKEN`, so take care when sharing report files.
+
+Ray writes one report per target process. A unique capture ID prevents stale
+files in a reused Ray session from entering the result, and the recipe waits
+for stable reports before copying them into `$RUN_DIR/nsight_update_actor`.
+Open the controller and actor reports together with Nsight Systems' multi-report
+view. For reports collected on one host, prefer `TSC` alignment and verify the
+alignment source in **Analysis Summary**. `UTC` is suitable for coarse phase
+analysis but not millisecond-scale cross-process latency comparisons.
+
+This recipe intentionally requires one node. A multi-node variant needs a
+collector on every node and synchronized clocks.
+
+### 5. Rollout servers (vLLM-Omni)
+
+Generation runs in vLLM-Omni server processes, so it needs its own profiler,
+driven by `actor_rollout_ref.rollout.profiler`. The trainer starts/stops it
+around the generation phase of each step in `global_profiler.steps`, and the
+servers record through vLLM's built-in torch profiler (`discrete=True` is
+required — the server rejects continuous mode):
+
+```bash
+global_profiler.tool=torch \
+global_profiler.steps=[1] \
+actor_rollout_ref.rollout.profiler.enable=True \
+actor_rollout_ref.rollout.profiler.ranks=[0] \
+actor_rollout_ref.rollout.profiler.tool=torch \
+actor_rollout_ref.rollout.profiler.tool_config.torch.contents=[cpu,cuda] \
+actor_rollout_ref.rollout.profiler.tool_config.torch.discrete=True
+```
+
+`ranks` selects global ranks within the rollout workers; the owning replicas
+collect traces. Each profiled replica writes its trace to
+`{save_path}/agent_loop_rollout_replica_{rank}`, next to the actor traces.
+For diffusion V1 rollout collection, keep
+`global_profiler.profile_continuous_steps=False`. V1 rejects continuous-step profiling
+when rollout profiling is enabled and profiling steps are configured;
+actor-only continuous profiling remains allowed. In `separate_async`, select ranks
+belonging to the standalone rollout replicas according to the actual worker
+layout, rather than using replica indices or physical device IDs.
+Combine with recipe 1 to capture the actor train phase and the rollout in the
+same step.
+
+### 6. Reward-model servers
+
+When `reward.reward_model.enable=True`, the reward model runs in its own
+vLLM server processes — the same server stack as recipe 5, driven by
+`reward.reward_model.rollout.profiler`:
+
+```bash
+global_profiler.tool=torch \
+global_profiler.steps=[1] \
+reward.reward_model.rollout.profiler.enable=True \
+reward.reward_model.rollout.profiler.ranks=[0] \
+reward.reward_model.rollout.profiler.tool=torch \
+reward.reward_model.rollout.profiler.tool_config.torch.contents=[cpu,cuda] \
+reward.reward_model.rollout.profiler.tool_config.torch.discrete=True
+```
+
+The trainer starts/stops it around the phase where the servers actually
+score: the generation phase when reward computation streams with the rollout
+(`reward.reward_model.enable_resource_pool=True`), or the reward phase in
+colocate mode. Each profiled replica writes to
+`{save_path}/reward_model/agent_loop_rollout_replica_{rank}`, keeping reward
+traces apart from the actor rollout ones.
+
+### 7. Ascend NPU profiling (`npu`)
+
+NPU profiling supports diffusion training through `main_diffusion` or
+`main_diffusion_v1`, and Omni training through `main_omni` with PPO V1. You can collect actor training
+and rollout inference traces in the same run, or enable either role separately.
+Set `global_profiler.tool=npu` and configure each role under
+`actor_rollout_ref.{actor,rollout}.profiler`.
+
+#### Before you start
+
+- Set up the [NPU environment](../start/install_npu.md) and the training data.
+- For Omni PPO V1 with colocated actor and rollout, install a verl revision
+  containing [#7722](https://github.com/verl-project/verl/pull/7722)
+  (`0d3f56a8980a55bfbbf1214ea54fa1b32ca1405c`) before collecting both roles.
+  The fix stops rollout collection before training computation begins.
+  The repository's current verl pin (`fefb080`) predates this fix.
+  <!-- TODO: Remove the manual verl revision requirement above once
+  .github/verl_pin.txt includes verl-project/verl#7722. -->
+- Install `torch-npu>=2.10.0.post6` with a compatible PyTorch and CANN environment.
+  Start with `contents='[npu,cpu]'` and add `module` or `stack` as needed;
+  rollout collection options also depend on the inference backend.
+
+Diffusion V1 (`trainer.use_v1=True`) supports `sync` and `separate_async`.
+Use the same per-role options below, with the device-selection constraints
+for your training mode.
+
+#### Collect actor and rollout traces
+
+Choose a launcher for your model. The same profiling overrides work with both
+of these NPU examples:
+
+| Training workload | Launcher |
+| --- | --- |
+| Qwen-Image FlowGRPO LoRA | `examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_lora_npu.sh` |
+| Qwen3-Omni GSPO on AVQA | `examples/gspo_trainer/qwen3_omni/run_qwen3_omni_thinker_gspo_avqa_v1.sh` |
+
+Set `RECIPE` to your launcher and select training steps 1 and 2:
+
+```bash
+RECIPE=examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_lora_npu.sh
+bash "$RECIPE" \
+    global_profiler.tool=npu \
+    global_profiler.steps='[1,2]' \
+    global_profiler.profile_continuous_steps=False \
+    global_profiler.save_path=./outputs/profile \
+    actor_rollout_ref.actor.profiler.enable=True \
+    actor_rollout_ref.actor.profiler.tool=npu \
+    actor_rollout_ref.actor.profiler.ranks='[0]' \
+    actor_rollout_ref.actor.profiler.tool_config.npu.contents='[npu,cpu]' \
+    actor_rollout_ref.actor.profiler.tool_config.npu.level=level0 \
+    actor_rollout_ref.actor.profiler.tool_config.npu.analysis=True \
+    actor_rollout_ref.actor.profiler.tool_config.npu.discrete=True \
+    actor_rollout_ref.rollout.profiler.enable=True \
+    actor_rollout_ref.rollout.profiler.tool=npu \
+    actor_rollout_ref.rollout.profiler.ranks='[0]' \
+    actor_rollout_ref.rollout.profiler.tool_config.npu.contents='[npu,cpu]' \
+    actor_rollout_ref.rollout.profiler.tool_config.npu.discrete=True
+```
+
+The example selects actor rank 0 and the rollout replica that owns global rank 0.
+A tensor-parallel rollout engine collects across its whole replica. Profiling
+output is saved under `./outputs/profile`, with rollout output in a
+`agent_loop_rollout_replica_{rank}` subdirectory. To collect all ranks, set
+`all_ranks=True` separately for each role. Profiling is disabled by default;
+select the global steps and explicitly enable each role to collect traces.
+These fields already exist, so use plain `key=value` overrides without a `+` prefix.
+
+Engine-side NPU rollout profiling requires
+`rollout.profiler.tool_config.npu.discrete=True` regardless of the trainer.
+The example also sets actor `discrete=True` to collect individual training
+stages. Actor-only collection can use either `discrete` value where supported
+by the backend.
+
+For diffusion V1 (`sync` and `separate_async`), rollout profiling additionally
+requires `global_profiler.profile_continuous_steps=False`. The V1 entrypoint
+rejects continuous-step profiling when rollout profiling is enabled and
+profiling steps are configured.
+
+Concurrent NPU collectors must use disjoint physical devices. For diffusion
+V1 `separate_async`, set `all_ranks=False` and select actor and standalone
+rollout ranks accordingly. This also applies with
+`trainer.v1.separate_async.hybrid_rollout.enable_switch=True`; lending actor
+devices to hybrid rollout does not serialize collectors on the same device.
+When switching is disabled, V1 does not profile the unused hybrid manager.
+
+Set either role's `profiler.enable=False` to
+collect only the other role. Reward-model profiling is configured separately
+under `reward.reward_model.rollout.profiler` (recipe 6).
+
+`actor_rollout_ref.rollout.profiler.ranks` contains global
+ranks within the rollout workers, not replica IDs or physical device IDs.
+For replica world size `W = TP * DP * PP`, selecting rank `r` selects replica
+`r // W`; collection may
+include all devices of that replica. In diffusion V1 `separate_async`, with
+`H` hybrid replicas preceding the
+standalone replicas, standalone ranks begin at `H * W`. For example, eight
+hybrid devices with `TP=2, DP=PP=1` occupy ranks 0–7: actor rank `[0]` and
+standalone rollout rank `[8]` select disjoint devices, provided the resource
+pools are placed accordingly. Check actual replica placement; equal or unequal
+rank numbers across roles alone do not prove physical-device overlap.
+
+`all_ranks=true` remains usable when the participating collectors are physically
+disjoint. Manual rank selection cannot make overlapping NPU collectors safe.
+In asynchronous training with a replay buffer, profile steps denote trainer
+time windows, not the policy version of buffered samples. Check trace contents
+against the selected ranks and actual engine placement.
+
+#### Collection options
+
+The per-role `tool_config.npu` block also exposes the following options:
+
+| Option | Values / behavior | Default |
+| --- | --- | --- |
+| `contents` | Collection options: `npu`, `cpu`, `memory`, `shapes`, `module`, `stack` | `[]` |
+| `level` | `level_none`, `level0`, `level1`, `level2` | `level0` |
+| `analysis` | Automatically parse the collected data | `True` |
+| `discrete` | Separate databases per task when `True`; tasks in one training step share a database when `False` | `False` |
+| `profile_token_start` / `profile_token_end` | Response-token collection bounds for Omni autoregressive decoding (end exclusive), where supported by the inference engine | `null` / `null` (full collection) |
+
+`profile_token_start` and `profile_token_end` select response-token positions
+during Omni autoregressive decoding in compatible rollout engines. They do not
+select diffusion denoising steps or control the actor's forward/backward passes.
+
+The table lists defaults for the shared diffusion/reward profiler config.
+Omni actor/ref/rollout defaults come from upstream verl and can differ.
+
+#### View the results
+
+To inspect the collected Ascend traces, follow the upstream guide's
+[visualization and offline parsing instructions](https://github.com/verl-project/verl/blob/main/docs/ascend_tutorial/en/dev_guide/performance/ascend_profiling.rst#visualization).
+When automatic analysis is disabled, **parse the raw data offline before opening
+it in MindStudio Insight**. Run the following Python code in your torch-npu
+environment, replacing the example path with your actual `*_ascend_pt` trace
+directory:
+
+```python
+import torch_npu
+
+torch_npu.profiler.profiler.analyse(
+    profiler_path="./outputs/profile/actor_update/worker_123_20260918_ascend_pt"
+)
+```
+
+To parse multiple traces together, you can also pass their immediate parent
+directory (for example, `./outputs/profile/actor_update`). The parser checks
+that directory and its immediate children; it does not recursively search
+all nested stage directories.
+
+Repeat for other actor stages or rollout trace directories as needed, then open
+the parsed results in MindStudio Insight. Rollout collection is performed by the inference
+engine, so its parsing behavior and supported options can differ from the actor's;
+the actor's `analysis=True` does not configure rollout parsing.
+
+#### Further reading
+
+- [verl NPU profiling examples](https://github.com/verl-project/verl/blob/fefb080262e1c015a0ea05f958822a6a512dc795/examples/profile/README.md#npu-profiling)
+  cover continuous and discrete collection. Their `PROFILE_*` environment
+  variables apply to the upstream scripts; use the Hydra overrides above with
+  VeRL-Omni launchers.
+- [Ascend profiling guide](https://github.com/verl-project/verl/blob/main/docs/ascend_tutorial/en/dev_guide/performance/ascend_profiling.rst)
+  explains collection levels, Agent Loop profiling, and trace analysis.
+
+## Lightweight profiling recipe
+
+Profiling a full FlowGRPO step produces a large trace that is slow to open.
+This recipe uses a `main_diffusion` (v0) launcher on purpose: the diffusion
+V1 trainer (`main_diffusion_v1`) does not yet support step-based profiling,
+so keep profiling recipes on the v0 launchers until V1 gains
+`global_profiler.steps` support. The `main_diffusion` launchers under
+`examples/` pass `"$@"` through to Hydra, which resolves duplicate overrides
+last-wins — so appending overrides to any recipe shrinks its footprint
+without editing the script. The following profiles a single lightweight step
+of the SD3.5 OCR recipe (2 rollouts instead of 8, 4 denoising steps instead
+of 10, 256px instead of 384px, train batch 4 instead of 8), capturing the
+actor train phase, the rollout servers and the reward-model servers
+(recipes 1, 5 and 6 combined):
+
+```bash
+bash examples/flowgrpo_trainer/sd35/run_sd35_medium_ocr_lora.sh \
+    data.train_batch_size=4 \
+    actor_rollout_ref.rollout.n=2 \
+    actor_rollout_ref.rollout.pipeline.num_inference_steps=4 \
+    actor_rollout_ref.rollout.pipeline.height=256 \
+    actor_rollout_ref.rollout.pipeline.width=256 \
+    actor_rollout_ref.rollout.algo.sde_window_range=[0,4] \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
+    trainer.total_training_steps=1 \
+    trainer.save_freq=-1 \
+    trainer.test_freq=-1 \
+    trainer.resume_mode=disable \
+    trainer.logger='["console"]' \
+    global_profiler.tool=torch \
+    global_profiler.steps=[1] \
+    global_profiler.save_path=./outputs/profile_sd35 \
+    actor_rollout_ref.actor.profiler.enable=True \
+    actor_rollout_ref.actor.profiler.ranks=[0] \
+    actor_rollout_ref.actor.profiler.tool=torch \
+    actor_rollout_ref.actor.profiler.tool_config.torch.contents=[cpu,cuda] \
+    actor_rollout_ref.actor.profiler.tool_config.torch.discrete=False \
+    actor_rollout_ref.rollout.profiler.enable=True \
+    actor_rollout_ref.rollout.profiler.ranks=[0] \
+    actor_rollout_ref.rollout.profiler.tool=torch \
+    actor_rollout_ref.rollout.profiler.tool_config.torch.contents=[cpu,cuda] \
+    actor_rollout_ref.rollout.profiler.tool_config.torch.discrete=True \
+    reward.reward_model.rollout.profiler.enable=True \
+    reward.reward_model.rollout.profiler.ranks=[0] \
+    reward.reward_model.rollout.profiler.tool=torch \
+    reward.reward_model.rollout.profiler.tool_config.torch.contents=[cpu,cuda] \
+    reward.reward_model.rollout.profiler.tool_config.torch.discrete=True
+```
+
+Measured on 3×RTX 4090 against the v0 recipe defaults: traces 163 MB → 32 MB,
+profiled step 616 s → 70 s.
+
+The `trainer.*` lines are not optional: the run's last step force-triggers
+checkpoint saving and validation when `save_freq`/`test_freq` > 0, and a
+leftover checkpoint auto-resumes past the profiled step, silently skipping
+profiling.
+
+### Adapting to other recipes
+
+The `trainer.*`, `global_profiler.*` and `*.profiler.*` overrides above work
+unchanged for any recipe. Re-derive the footprint overrides from the
+recipe's own values, minding two couplings:
+
+- **Denoising steps vs. SDE window**: a window reaching past the last
+  denoising step produces ragged per-sample tensors and fails rollout
+  post-processing. Pin `sde_window_range=[0,<num_inference_steps>]` and keep
+  `num_inference_steps >= sde_window_size` (the SD3.5 recipe's window —
+  size 3, range `[0,5]` — assumes 10 steps).
+- **Batch vs. micro batch**: the diffusion engine chunks batches statically,
+  so the per-GPU sample count (`train_batch_size * rollout.n / num actor
+  GPUs`) must stay divisible by each micro batch size. The SD3.5 recipe's
+  micro batch of 8 assumes 32 samples per GPU; the lightweight footprint
+  leaves 4, hence 2.
+
+## Implementation notes
+
+* Workers are wrapped with `verl.utils.profiler.DistProfilerExtension`, which
+  exposes `start_profile`/`stop_profile` Ray methods. The diffusion trainer
+  invokes them around each profiled step, mirroring
+  [`verl/trainer/ppo/ray_trainer.py`](https://github.com/verl-project/verl/blob/main/verl/trainer/ppo/ray_trainer.py).
+* `global_profiler.profile_continuous_steps=True` keeps a single profiling
+  database open across consecutive steps in `global_profiler.steps`, which is
+  helpful for analysing inter-step behaviour. Diffusion V1 follows
+  `verl/trainer/ppo/v1/trainer_base.py`: use continuous windows for actor-only
+  collection, and non-continuous windows when collecting rollout traces.
+* In the legacy diffusion trainer, for the rollout servers, the trainer calls
+  `llm_server_manager.start_profile()`/`stop_profile()` around the generation
+  phase of profiled steps; the servers record through vLLM's built-in torch
+  profiler (recipe 5). The reward-model servers are driven the same way
+  through `verl_omni.reward_loop.OmniRewardLoopManager` (recipe 6).
+* `relocate_results` and `finish_hook_*` are forwarded to upstream workers.
+  Diffusion V1 follows upstream finish-hook scheduling: a closing training-worker
+  window runs the hook on the largest configured profile step, or on the final
+  training step if that step is profiled. Keep selected steps within the run's
+  step and epoch limits.
+  Rollout-only collection does not run a training-worker finish hook.
+
+## Further reading
+
+* Upstream PyTorch profiler guide:
+  [`docs/perf/torch_profiling.md` in verl](https://github.com/verl-project/verl/blob/main/docs/perf/torch_profiling.md)
+* Upstream Nsight guide:
+  [`docs/perf/nsight_profiling.md` in verl](https://github.com/verl-project/verl/blob/main/docs/perf/nsight_profiling.md)

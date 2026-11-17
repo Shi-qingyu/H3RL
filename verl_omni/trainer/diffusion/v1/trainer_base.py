@@ -1,0 +1,2040 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
+import math
+import os
+import uuid
+from abc import ABC, abstractmethod
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from numbers import Integral
+from pprint import pprint
+
+import numpy as np
+import ray
+import torch
+import transfer_queue as tq
+from omegaconf import OmegaConf, open_dict
+from packaging.version import InvalidVersion, Version
+from torchdata.stateful_dataloader import StatefulDataLoader
+from tqdm import tqdm
+from transfer_queue import KVBatchMeta
+from verl import DataProto
+from verl.checkpoint_engine import CheckpointEngineManager
+from verl.experimental.agent_loop import AgentLoopManager
+from verl.protocol import pad_dataproto_to_divisor
+from verl.single_controller.ray import (
+    RayClassWithInitArgs,
+    RayWorkerGroup,
+    ResourcePoolManager,
+    create_colocated_worker_cls,
+)
+from verl.single_controller.ray.base import split_resource_pool
+from verl.trainer.distillation import is_distillation_enabled
+from verl.trainer.ppo.metric_utils import compute_variance_proxy_metrics, process_validation_metrics
+from verl.trainer.ppo.reward import extract_reward
+from verl.trainer.ppo.utils import Role, need_reference_policy
+from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
+from verl.trainer.ppo.v1.utils import MetricsAggregator
+from verl.utils import tensordict_utils as tu
+from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
+from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.debug import marked_timer
+from verl.utils.metric import reduce_metrics
+from verl.utils.py_functional import rename_dict
+from verl.utils.skip import SkipManager
+from verl.utils.tracking import Tracking, ValidationGenerationsLogger
+
+from verl_omni.pipelines.rollout_media import (
+    MediaArtifact,
+    previews_from_batch,
+    resolve_batch_media_kind,
+    resolve_is_video,
+    validate_previews,
+    validate_visual_media_batch_rank,
+)
+from verl_omni.trainer.diffusion.diffusion_algos import get_diffusion_loss_fn
+from verl_omni.trainer.diffusion.diffusion_metric_utils import (
+    compute_data_metrics_diffusion,
+    compute_old_policy_metrics,
+    compute_reward_extra_metrics_diffusion,
+    compute_throughput_metrics_diffusion,
+    compute_timing_metrics_diffusion,
+)
+from verl_omni.trainer.diffusion.diffusion_trainer_utils import (
+    old_policy_decay,
+    skip_old_log_prob,
+    track_nonfinite_grad_streak,
+    validate_distillation_config,
+)
+from verl_omni.trainer.diffusion.ray_diffusion_trainer import (
+    BaseRayDiffusionTrainer,
+    _resolve_rollout_media_field,
+    _to_diffusion_worker_tensordict,
+    _validate_generation_outputs,
+    compute_advantage,
+    dump_generations,
+)
+from verl_omni.trainer.diffusion.rollout_correction import (
+    apply_bypass_mode_to_diffusion_batch,
+    apply_rollout_correction_to_diffusion_batch,
+    compute_rollout_corr_metrics_from_batch,
+    rollout_correction_enabled,
+)
+from verl_omni.trainer.diffusion.teacher_manager import DiffusionTeacherManager
+from verl_omni.trainer.diffusion.v1.tq_utils import (
+    canonicalize_diffusion_tq_meta,
+    diffusion_dump_tq_fields,
+    diffusion_metric_tq_fields,
+    diffusion_persisted_tq_fields,
+    diffusion_tq_batch_to_dataproto,
+    put_dataproto_fields_to_tq,
+    sort_diffusion_tq_keys,
+)
+from verl_omni.utils.config import resolve_lora_config
+from verl_omni.utils.net_utils import worker_group_port_ranges
+from verl_omni.utils.tracking import batch_items, validate_audio_batch
+from verl_omni.workers.config.reward import (
+    reward_is_enabled,
+    reward_pool_is_separate,
+    reward_role_required,
+    streaming_reward_enabled,
+)
+from verl_omni.workers.engine_workers import ActorRolloutRefWorker, resolve_teacher_infer_micro_batch_size
+from verl_omni.workers.rollout.replica import DiffusionLLMServerManager as LLMServerManager
+from verl_omni.workers.utils.padding import embeds_padding_2_no_padding
+
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
+def _tq_supports_checkpoint() -> bool:
+    """Return whether TransferQueue supports saving and loading checkpoints."""
+    try:
+        version_supported = Version(getattr(tq, "__version__", "")) >= Version("0.1.9")
+    except InvalidVersion:
+        return False
+    return (
+        version_supported
+        and callable(getattr(tq, "save_checkpoint", None))
+        and callable(getattr(tq, "load_checkpoint", None))
+    )
+
+
+DIFFUSION_TRAINER_REGISTRY: dict[str, type] = {}
+
+
+def register_diffusion_trainer(name: str):
+    """Class decorator that registers a PolicyGradientDiffusionTrainerV1 subclass."""
+
+    def decorator(cls):
+        DIFFUSION_TRAINER_REGISTRY[name] = cls
+        return cls
+
+    return decorator
+
+
+def get_diffusion_trainer_cls(name: str):
+    """Return the diffusion v1 trainer class registered under ``name``."""
+    try:
+        return DIFFUSION_TRAINER_REGISTRY[name]
+    except KeyError:
+        available = ", ".join(sorted(DIFFUSION_TRAINER_REGISTRY)) or "<none>"
+        raise ValueError(f"Unknown diffusion trainer '{name}'. Available: {available}.") from None
+
+
+def _copy_media_to_cpu(value):
+    """Return an independent CPU snapshot safe for background media export."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device="cpu", copy=True)
+    if isinstance(value, MediaArtifact):
+        return replace(value, data=_copy_media_to_cpu(value.data))
+    if isinstance(value, list):
+        return [_copy_media_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_copy_media_to_cpu(item) for item in value)
+    return value
+
+
+class PolicyGradientDiffusionTrainerV1(ABC):
+    """Base class for v1 policy-gradient diffusion trainers.
+
+    Mirrors the upstream ``PPOTrainer`` v1 lifecycle (replay buffer, TransferQueue
+    rollout handoff, mode hooks, ``fit``/``step``) while keeping the diffusion
+    ``DataProto`` compute contract. Subclasses only define mode-specific hooks
+    (when rollout replicas sleep, abort, resume, or receive updated weights).
+    """
+
+    def __init__(self, config):
+        self.config = config
+        self.trainer_mode = config.trainer.v1.trainer_mode
+        self.parameter_sync_step = config.trainer.v1.get(self.trainer_mode, {}).get("parameter_sync_step", 1)
+        loss_mode = config.actor_rollout_ref.actor.diffusion_loss.loss_mode
+        self._is_direct_preference = config.algorithm.get("trainer_type", "policy_gradient") == "direct_preference"
+        if self._is_direct_preference:
+            if config.algorithm.get("sample_source", "online") == "offline":
+                raise NotImplementedError(
+                    "Diffusion offline DPO stays on the v0 trainer by design. Use "
+                    "`python -m verl_omni.trainer.main_diffusion` (the legacy v0 entrypoint)."
+                )
+            self._loss_fn = get_diffusion_loss_fn(loss_mode)
+            self._loss_fn.validate_trainer_config(config)
+            self._has_old_adapter = "old" in resolve_lora_config(config.actor_rollout_ref.model).adapters
+            if self._has_old_adapter:
+                self._validate_old_adapter_config()
+        else:
+            self._loss_fn = None
+            self._has_old_adapter = False
+        # DPO needs trainer-side ref noise preds even when KL is disabled.
+        self.use_critic = False  # Diffusion has no critic worker group.
+        self.use_reference_policy = need_reference_policy(config) or (loss_mode == "dpo")
+        self.use_rm = reward_is_enabled(config)
+        self.use_teacher_policy = is_distillation_enabled(config.get("distillation"))
+        self.distillation_config = omega_conf_to_dataclass(config.distillation) if self.use_teacher_policy else None
+        validate_distillation_config(config)
+        self.skip_old_log_prob = skip_old_log_prob(config)
+        if self.skip_old_log_prob:
+            logger.info("The actor loss reads no log-probs; skipping the old_log_prob stage.")
+        self._teacher_one_step_off = self.use_teacher_policy and self.distillation_config.scheduler == "one_step_off"
+        self._pending_teacher_batch = None
+        self.replay_buffer = self._build_replay_buffer()
+
+        # ref_in_actor: reference policy is the actor without lora applied.
+        self.ref_in_actor = resolve_lora_config(config.actor_rollout_ref.model).enabled
+
+        self.checkpoint_manager = None
+        self.global_steps = 0
+        # Local update index within the parameter-sync cycle.
+        self.local_trigger_step = 0
+        self._nonfinite_grad_streak = 0
+
+    def _build_replay_buffer(self) -> ReplayBuffer:
+        sampler_config = self.config.trainer.v1.sampler
+        if sampler_config.get("drop_incomplete_groups", False):
+            if self.trainer_mode != "sync":
+                raise ValueError("drop_incomplete_groups is only supported with trainer_mode='sync'")
+            max_refill_rounds = sampler_config.get("max_incomplete_group_refill_rounds", 3)
+            if isinstance(max_refill_rounds, bool) or not isinstance(max_refill_rounds, int) or max_refill_rounds <= 0:
+                raise ValueError("max_incomplete_group_refill_rounds must be a positive integer")
+
+        replay_buffer_cls = ReplayBufferAsync if self.trainer_mode == "separate_async" else ReplayBuffer
+        # ReplayBuffer.sample() discovers finished groups by sleeping a fixed
+        # poll_interval between tq.kv_list() calls. The upstream 2.0s default
+        # quantizes sync gen: sample() returns only on a poll boundary, so a
+        # rollout finishing mid-sleep idles the trainer for the remainder
+        # (observed +1.15s/step on Qwen-Image FlowGRPO). Sync mode has nothing
+        # to overlap with the wait, so poll fast unless configured otherwise.
+        poll_interval = sampler_config.get("poll_interval", None)
+        if poll_interval is None:
+            poll_interval = 2.0 if self.trainer_mode == "separate_async" else 0.05
+        return replay_buffer_cls(
+            trainer_mode=self.trainer_mode,
+            trainer_config=self.config.trainer.v1.get(self.trainer_mode, {}),
+            max_off_policy_threshold=sampler_config.max_off_policy_threshold,
+            max_off_policy_strategy=sampler_config.max_off_policy_strategy,
+            sampler_kwargs=sampler_config.sampler_kwargs,
+            refill_fn=self._add_prompts_to_generate,
+            poll_interval=float(poll_interval),
+        )
+
+    def init(self):
+        """Initialize workers, rollout server, reward loop, checkpoint engine."""
+        self._setup()
+        if self._has_old_adapter:
+            self.actor_rollout_wg.copy_adapter(source="default", target="old")
+        self.on_init_end()
+
+    def _rollout_server_managers(self) -> list:
+        """LLM server managers whose inference engines take part in rollout profiling.
+
+        Subclasses owning additional replicas (e.g. the standalone rollout of separate-async
+        training) extend this list so those engines are profiled as well.
+        """
+        managers = [getattr(self, "llm_server_manager", None)]
+        return [manager for manager in managers if manager is not None]
+
+    def _start_rollout_profiling(self) -> None:
+        """Start rollout profiling."""
+        for manager in self._rollout_server_managers():
+            manager.start_profile()
+
+    def _stop_rollout_profiling(self) -> None:
+        """Stop rollout profiling."""
+        for manager in self._rollout_server_managers():
+            manager.stop_profile()
+
+    def _start_profiling(self) -> None:
+        """Start profiling for all worker groups if profiling is enabled."""
+        do_profile = (
+            not self.prev_step_profile and self.curr_step_profile
+            if self.config.global_profiler.profile_continuous_steps
+            else self.curr_step_profile
+        )
+
+        if do_profile:
+            # "train", not "e2e": this window only holds what the training worker itself runs
+            # (log-prob forwards and the actor update). Generation happens in the inference
+            # engines below, which write their own traces.
+            #
+            # In the hybrid engine, actor/rollout and the (colocated) reference -- and sometimes the
+            # critic -- share ONE worker group object, so ref_policy_wg / critic_wg can alias
+            # actor_rollout_wg. Each start/stop_profile round-trips to every rank and, on stop, runs
+            # the finish hook (e.g. the user's trace-upload command); driving the same physical
+            # workers more than once would fire that hook once per alias and upload the same trace
+            # file multiple times. Drive each distinct worker group exactly once.
+            self.actor_rollout_wg.start_profile(role="train", profile_step=self.global_steps)
+            seen = {id(self.actor_rollout_wg)}
+            if self.use_reference_policy and id(self.ref_policy_wg) not in seen:
+                seen.add(id(self.ref_policy_wg))
+                self.ref_policy_wg.start_profile(profile_step=self.global_steps)
+            if self.use_critic and id(self.critic_wg) not in seen:
+                seen.add(id(self.critic_wg))
+                self.critic_wg.start_profile(profile_step=self.global_steps)
+            self._start_rollout_profiling()
+
+    def _stop_profiling(self) -> None:
+        """Stop profiling for all worker groups if profiling is enabled."""
+        this_step_profile = self.curr_step_profile
+        self.next_step_profile = (
+            self.global_steps + 1 in self.config.global_profiler.steps
+            if self.config.global_profiler.steps is not None
+            else False
+        )
+        do_profile = (
+            self.curr_step_profile and not self.next_step_profile
+            if self.config.global_profiler.profile_continuous_steps
+            else self.curr_step_profile
+        )
+        self.prev_step_profile = self.curr_step_profile
+        self.curr_step_profile = self.next_step_profile
+
+        if do_profile:
+            # Run the finish command (e.g. the trace upload) only once, on the last profiled step, so
+            # a command that uploads the whole save_path sends each trace once instead of re-uploading
+            # the accumulating directory every step. "Last" is the largest configured step, or the
+            # run's final step if it ends earlier on a profiled step.
+            profiled_steps = self.config.global_profiler.steps
+            is_last_step = self.global_steps >= self.total_training_steps
+            run_command = bool(
+                this_step_profile and profiled_steps and (self.global_steps == max(profiled_steps) or is_last_step)
+            )
+            # See _start_profiling: skip aliased worker groups so the finish hook (and any trace
+            # upload it triggers) fires exactly once per distinct process, not once per role alias.
+            self.actor_rollout_wg.stop_profile(run_command=run_command)
+            seen = {id(self.actor_rollout_wg)}
+            if self.use_reference_policy and id(self.ref_policy_wg) not in seen:
+                seen.add(id(self.ref_policy_wg))
+                self.ref_policy_wg.stop_profile(run_command=run_command)
+            if self.use_critic and id(self.critic_wg) not in seen:
+                seen.add(id(self.critic_wg))
+                self.critic_wg.stop_profile(run_command=run_command)
+
+    def fit(self, agent_loop_manager: AgentLoopManager):
+        """Run the v1 training loop, mirroring upstream ``PPOTrainer.fit``."""
+        self.agent_loop_manager = agent_loop_manager
+
+        # initialize SkipManager for V1 rollout skip support (no-op until configured).
+        SkipManager.init(self.config)
+
+        self.logger = Tracking(
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
+            default_backend=self.config.trainer.logger,
+            config=OmegaConf.to_container(self.config, resolve=True),
+        )
+        self.validation_generations_logger = ValidationGenerationsLogger(
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
+        )
+
+        if self.config.trainer.get("val_before_train", True):
+            self.on_validate_begin()
+            val_metrics = self._validate()
+            self.on_validate_end()
+            assert val_metrics, f"{val_metrics=}"
+            pprint(f"Initial validation metrics: {val_metrics}")
+            self.logger.log(data=val_metrics, step=self.global_steps)
+            if self.config.trainer.get("val_only", False):
+                self._shutdown_dump_executor()
+                self._shutdown_dataloaders()
+                return
+
+        current_epoch = self.global_steps // self.steps_per_epoch
+        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Diffusion Training")
+
+        self.global_steps += 1
+        SkipManager.set_step(self.global_steps)
+        self._reissue_inflight_prompts()
+        self.prev_step_profile = False
+        self.curr_step_profile = (
+            self.global_steps in self.config.global_profiler.steps
+            if self.config.global_profiler.steps is not None
+            else False
+        )
+        self.next_step_profile = False
+
+        self.on_train_begin()
+        last_val_metrics = None
+        while current_epoch < self.config.trainer.total_epochs and self.global_steps <= self.total_training_steps:
+            is_last_step = self.global_steps >= self.total_training_steps
+            metrics: dict = {}
+            self.timing_raw: dict = {}
+            with marked_timer("step", self.timing_raw):
+                self.on_step_begin()
+                self._start_profiling()
+                batch = self.step(metrics, self.timing_raw)
+                self._stop_profiling()
+                if self.config.trainer.save_freq > 0 and (
+                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0
+                ):
+                    with marked_timer("save_checkpoint", self.timing_raw, color="green"):
+                        self._save_checkpoint()
+                self.on_step_end()
+                metrics.update(self._consume_sync_metrics())
+
+            if self.config.trainer.test_freq > 0 and (
+                is_last_step or self.global_steps % self.config.trainer.test_freq == 0
+            ):
+                with marked_timer("testing", self.timing_raw, color="green"):
+                    self.on_validate_begin()
+                    val_metrics = self._validate()
+                    self.on_validate_end()
+                    if is_last_step:
+                        last_val_metrics = val_metrics
+                metrics.update(val_metrics)
+
+            self._compute_metrics(batch, metrics, self.timing_raw, self.global_steps, current_epoch)
+
+            rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+            rollout_data_save_freq = self.config.trainer.get("rollout_data_save_freq", 1)
+            if rollout_data_dir and rollout_data_save_freq > 0 and self.global_steps % rollout_data_save_freq == 0:
+                self._log_rollout_data(batch, self.timing_raw, rollout_data_dir)
+
+            tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
+
+            self.logger.log(data=metrics, step=self.global_steps)
+            progress_bar.update(1)
+            self.global_steps += 1
+            SkipManager.set_step(self.global_steps)
+            current_epoch = (self.global_steps - 1) // self.steps_per_epoch
+            if is_last_step:
+                self._shutdown_dump_executor()
+                pprint(f"Final validation metrics: {last_val_metrics}")
+                progress_bar.close()
+                self._shutdown_dataloaders()
+                return
+
+        self.on_train_end()
+        self._shutdown_dump_executor()
+        self._shutdown_dataloaders()
+
+    def step(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
+        """Feed one train batch and run ``parameter_sync_step`` local updates."""
+        train_batch_size = self.config.data.train_batch_size
+        assert train_batch_size % self.parameter_sync_step == 0, (
+            f"train_batch_size ({train_batch_size}) must be divisible by "
+            f"parameter_sync_step ({self.parameter_sync_step})"
+        )
+        sample_batch_size = train_batch_size // self.parameter_sync_step
+
+        prepare_metrics = self.prepare_step()
+
+        metrics_aggregator = MetricsAggregator()
+        metrics_aggregator.aggregation_rules["sum"].extend(
+            [
+                "training/rollout_failure/evicted_groups",
+                "training/rollout_failure/evicted_trajectories",
+                "training/rollout_failure/refilled_prompts",
+                "training/rollout_failure/refill_rounds",
+            ]
+        )
+        if prepare_metrics:
+            metrics_aggregator.add_step_metrics(prepare_metrics)
+        prefetched_batches = None
+        if self._should_prefetch_local_batches():
+            prefetched_batches = []
+            with marked_timer("gen", timing_raw, color="red"):
+                self.on_sample_begin()
+                for trigger_idx in range(self.parameter_sync_step):
+                    self.local_trigger_step = trigger_idx
+                    prefetched_batches.append(self._sample_training_batch(sample_batch_size))
+                self.on_sample_end()
+
+        combined_keys: list = []
+        combined_tags: list = []
+        combined_partition_id = "train"
+        for trigger_idx in range(self.parameter_sync_step):
+            self.local_trigger_step = trigger_idx
+            iter_metrics: dict = {}
+            if prefetched_batches is None:
+                batch = self._step_once(iter_metrics, timing_raw, sample_batch_size)
+            else:
+                batch_meta, off_policy_metrics = prefetched_batches[trigger_idx]
+                iter_metrics.update(off_policy_metrics)
+                batch = self._train_sampled_batch(iter_metrics, timing_raw, batch_meta)
+            sample_count = sum(not tag.get("is_padding", False) for tag in batch.tags)
+            metrics_aggregator.add_step_metrics(iter_metrics, sample_count=sample_count)
+            combined_keys.extend(batch.keys)
+            combined_tags.extend(batch.tags)
+            combined_partition_id = batch.partition_id
+
+        metrics.update(metrics_aggregator.get_aggregated_metrics())
+        return KVBatchMeta(partition_id=combined_partition_id, keys=combined_keys, tags=combined_tags)
+
+    def prepare_step(self) -> dict:
+        """Submit this step's prompt batch before any mini-batch is sampled."""
+        with marked_timer("feed", self.timing_raw):
+            self._add_batch_to_generate()
+        return {}
+
+    def _step_once(self, metrics: dict, timing_raw: dict, sample_batch_size: int) -> KVBatchMeta:
+        """Sample one mini-batch from the replay buffer and run the diffusion PG pipeline."""
+        batch_meta = self._sample_batch(metrics, timing_raw, sample_batch_size)
+        if not self._teacher_one_step_off:
+            return self._train_sampled_batch(metrics, timing_raw, batch_meta)
+
+        # One-step-off: teacher scoring of the batch sampled here overlaps the actor
+        # update on the previously sampled batch. The first step samples twice to
+        # fill the pipeline; the last sampled batch is never trained.
+        prev, self._pending_teacher_batch = self._pending_teacher_batch, self._convert_and_dispatch(batch_meta)
+        if prev is None:
+            next_meta = self._sample_batch(metrics, timing_raw, sample_batch_size)
+            prev, self._pending_teacher_batch = self._pending_teacher_batch, self._convert_and_dispatch(next_meta)
+        batch_meta, data, teacher_handle = prev
+        return self._train_sampled_batch(metrics, timing_raw, batch_meta, data=data, teacher_handle=teacher_handle)
+
+    def _sample_batch(self, metrics: dict, timing_raw: dict, sample_batch_size: int) -> KVBatchMeta:
+        """Sample one mini-batch from the replay buffer inside the rollout-mode hooks."""
+        with marked_timer("gen", timing_raw, color="red"):
+            self.on_sample_begin()
+            batch_meta, off_policy_metrics = self._sample_training_batch(sample_batch_size)
+            metrics.update(off_policy_metrics)
+            self.on_sample_end()
+        return batch_meta
+
+    def _convert_and_dispatch(self, batch_meta: KVBatchMeta):
+        """Convert a sampled batch and start teacher scoring without waiting on it."""
+        data = diffusion_tq_batch_to_dataproto(batch_meta, pad_token_id=self.tokenizer.pad_token_id or 0)
+        return batch_meta, data, self.teacher_model_manager.dispatch_prev_sample_mean(data)
+
+    def _train_sampled_batch(
+        self,
+        metrics: dict,
+        timing_raw: dict,
+        batch_meta: KVBatchMeta,
+        data: DataProto | None = None,
+        teacher_handle=None,
+    ) -> KVBatchMeta:
+        """Run one diffusion policy-gradient update on an already sampled mini-batch."""
+        # Convert TQ rows to diffusion DataProto; from here on the driver owns the
+        # DataProto compute contract (no KVBatchMeta passed to diffusion workers).
+        if data is None:
+            data = diffusion_tq_batch_to_dataproto(batch_meta, pad_token_id=self.tokenizer.pad_token_id or 0)
+
+        # [OPTIONAL] colocated reward model
+        if self.reward_loop_manager.reward_loop_worker_handles is None and self.use_rm:
+            with marked_timer("reward", timing_raw, color="yellow"):
+                # Sync sampling hooks already put colocated rollout replicas to
+                # sleep. Sleeping them again can unmap the same accelerator
+                # memory twice. Async modes still need the explicit mid-cycle
+                # sleep because they do not share the sync hook guarantee.
+                if self.trainer_mode != "sync":
+                    self.checkpoint_manager.sleep_replicas()
+                data = data.union(self._compute_reward_colocate(data))
+                if self.trainer_mode != "sync":
+                    # Async modes have no guaranteed per-step wake of the
+                    # colocated replicas (separate_async's on_step_end only
+                    # syncs the standalone rollout, and switch_to_rollout is
+                    # not guaranteed to fire), so keep the mid-cycle wake+sync
+                    # or colocated generation stalls on stale weights.
+                    self.checkpoint_manager.update_weights(self.global_steps)
+                # In sync mode the replicas must stay asleep through the
+                # training phases below: update_weights resumes their weights
+                # (~55GB for Qwen-Image at rollout TP=1) and the actor update
+                # would OOM next to them. on_step_end wakes and weight-syncs
+                # for the next rollout.
+
+        if self._is_direct_preference:
+            return self._train_direct_preference_batch(metrics, timing_raw, batch_meta, data)
+
+        data = self._balance_batch(data, metrics=metrics)
+
+        # Bypass mode: skip old_log_prob recompute (2 policies).
+        rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+        bypass_recomputing_logprobs = bool(rollout_corr_config and rollout_corr_config.get("bypass_mode", False))
+        if bypass_recomputing_logprobs:
+            apply_bypass_mode_to_diffusion_batch(data)
+        elif not self.skip_old_log_prob:
+            with marked_timer("old_log_prob", timing_raw, color="blue"):
+                old_log_prob = self._compute_old_log_prob(data)
+                metrics.update(old_log_prob.meta_info.pop("metrics", {}))
+                data = data.union(old_log_prob)
+            assert "old_log_probs" in data.batch, f'"old_log_probs" not in {data.batch.keys()}'
+
+        metrics.update(
+            compute_rollout_corr_metrics_from_batch(
+                data,
+                bypass_mode=bypass_recomputing_logprobs,
+            )
+        )
+
+        if not bypass_recomputing_logprobs and rollout_correction_enabled(rollout_corr_config):
+            with marked_timer("rollout_corr", timing_raw, color="cyan"):
+                data, rollout_corr_metrics = apply_rollout_correction_to_diffusion_batch(data, rollout_corr_config)
+                metrics.update(rollout_corr_metrics)
+
+        if self.use_reference_policy:
+            with marked_timer("ref", timing_raw, color="olive"):
+                ref_log_prob = self._compute_ref_log_prob(data)
+                data = data.union(ref_log_prob)
+
+        if self.use_teacher_policy:
+            if teacher_handle is not None:
+                # one-step-off: scoring was dispatched when this batch was sampled
+                with marked_timer("wait_prev_teacher", timing_raw, color="olive"):
+                    data = data.union(self.teacher_model_manager.collect_prev_sample_mean(teacher_handle))
+            else:
+                # score the rollout trajectories with the frozen teacher
+                with marked_timer("teacher", timing_raw, color="olive"):
+                    data = data.union(self.teacher_model_manager.compute_prev_sample_mean(data))
+
+        with marked_timer("adv", timing_raw, color="brown"):
+            data = self._compute_advantage(data)
+
+        # Zero advantages of rows appended by _balance_batch so the unmasked
+        # FlowGRPO loss mean is not corrupted by duplicated real advantages.
+        # _compute_advantage recomputes advantages, so this must run after it.
+        data = self._zero_pad_row_advantages(data)
+
+        with marked_timer("update_actor", timing_raw, color="red"):
+            actor_output = self._update_actor(data)
+            actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+            metrics.update(actor_metrics)
+
+        # Persist computed fields back to TransferQueue so the sampled keys carry
+        # the full trajectory for metrics/dumping (keys are cleared after step).
+        # Slice to the original key count in case ``_balance_batch`` appended pad rows.
+        n_keys = len(batch_meta.keys)
+        if len(data) > n_keys:
+            data_for_tq = data.select_idxs(list(range(n_keys)))
+        else:
+            data_for_tq = data
+        put_dataproto_fields_to_tq(
+            batch_meta,
+            data_for_tq,
+            fields=diffusion_persisted_tq_fields("policy_gradient"),
+        )
+        return batch_meta
+
+    def _validate_old_adapter_config(self):
+        """Require the NFT old-adapter rollout/loss contract."""
+        rollout_cfg = self.config.actor_rollout_ref.rollout
+        actor_loss_cfg = self.config.actor_rollout_ref.actor.diffusion_loss
+        if rollout_cfg.rollout_adapter != "old":
+            raise ValueError("Old-adapter algorithms require actor_rollout_ref.rollout.rollout_adapter=old.")
+        if not get_diffusion_loss_fn(actor_loss_cfg.loss_mode).uses_old_adapter:
+            raise ValueError(
+                "Old-adapter algorithms require an actor_rollout_ref.actor.diffusion_loss.loss_mode that trains "
+                f"against the old adapter, got {actor_loss_cfg.loss_mode}."
+            )
+
+    def _prepare_actor_batch(self, batch: DataProto, reward_tensor: torch.Tensor) -> DataProto:
+        """Delegate algorithm-specific rollout-to-actor batch preparation."""
+        reward_tensor = reward_tensor.squeeze(-1).float() if reward_tensor.ndim > 1 else reward_tensor.float()
+        return self._loss_fn.prepare_actor_batch(batch, reward_tensor, self.config)
+
+    def _compute_ref_noise_pred(self, data: DataProto) -> DataProto | None:
+        """Reference transformer output and shared flow tensors for DPO."""
+        batch_td = _to_diffusion_worker_tensordict(data)
+        batch_td = embeds_padding_2_no_padding(batch_td)
+        metadata = {
+            "compute_loss": False,
+            "height": self.config.actor_rollout_ref.model.pipeline.height,
+            "width": self.config.actor_rollout_ref.model.pipeline.width,
+            "vae_scale_factor": self.config.actor_rollout_ref.model.get("vae_scale_factor", 8),
+        }
+        if self.ref_in_actor:
+            metadata["no_lora_adapter"] = True
+        tu.assign_non_tensor(batch_td, **metadata)
+        if self.ref_in_actor:
+            output = self.actor_rollout_wg.infer_actor_batch(batch_td)
+        else:
+            output = self.ref_policy_wg.infer_ref_batch(batch_td)
+        if output is None:
+            return None
+
+        noise_pred = tu.get(output, "noise_pred")
+        if noise_pred is None:
+            raise RuntimeError(
+                "Reference infer returned noise_pred=None. Diffusion DPO requires "
+                "model_type=diffusion_dpo_model so infer_actor_batch / infer_ref_batch "
+                "emit noise_pred rather than SDE log_probs."
+            )
+        if noise_pred.ndim >= 2 and noise_pred.shape[1] == 1:
+            noise_pred = noise_pred[:, 0]
+        noise = tu.get(output, "noise")
+        if noise.ndim >= 2 and noise.shape[1] == 1:
+            noise = noise[:, 0]
+        timesteps = tu.get(output, "timesteps")
+        if timesteps.ndim >= 2 and timesteps.shape[1] == 1:
+            timesteps = timesteps[:, 0]
+        ref_output = {
+            "ref_noise_pred": noise_pred.float(),
+            "noise": noise.float(),
+            "timesteps": timesteps.float(),
+        }
+        return DataProto.from_tensordict(tu.get_tensordict(ref_output))
+
+    def _update_old_policy(self) -> tuple[bool, float, str]:
+        """Refresh the NFT old-policy adapter (copy or EMA)."""
+        algo_cfg = self.config.algorithm
+        if self.global_steps % algo_cfg.old_policy_update_interval != 0:
+            return False, 0.0, "none"
+
+        decay = algo_cfg.old_policy_decay
+        if decay is None:
+            decay = old_policy_decay(self.global_steps, algo_cfg.old_policy_decay_schedule)
+
+        if decay == 0:
+            self.actor_rollout_wg.copy_adapter(source="default", target="old")
+            return True, float(decay), "copy"
+        self.actor_rollout_wg.ema_update_adapter(source="default", target="old", decay=decay)
+        return True, float(decay), "ema"
+
+    def _train_direct_preference_batch(
+        self, metrics: dict, timing_raw: dict, batch_meta: KVBatchMeta, data: DataProto
+    ) -> KVBatchMeta:
+        """Online DPO / DiffusionNFT update: pair (or NFT-prep) then ref noise + actor.
+
+        Unlike Flow-GRPO, DPO does not recompute SDE ``old_log_probs``. The DPO
+        engine returns ``noise_pred`` from ``infer_actor_batch``, so the PG
+        old-log-prob hop would crash with ``log_probs is None``.
+        """
+        with marked_timer("prepare_actor_batch", timing_raw, color="brown"):
+            reward_tensor, reward_extra_infos_dict = extract_reward(data)
+            data.batch["sample_level_scores"] = reward_tensor
+            if reward_extra_infos_dict:
+                data.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+            # Persist unpaired scores for metrics before pairing shrinks the batch.
+            data.batch["sample_level_rewards"] = data.batch["sample_level_scores"]
+            n_keys = len(batch_meta.keys)
+            data_for_tq = data.select_idxs(list(range(n_keys))) if len(data) > n_keys else data
+            put_dataproto_fields_to_tq(
+                batch_meta,
+                data_for_tq,
+                fields=diffusion_persisted_tq_fields("direct_preference"),
+            )
+            data = self._prepare_actor_batch(data, reward_tensor)
+            data.batch["sample_level_rewards"] = data.batch["sample_level_scores"]
+
+        if self.use_reference_policy:
+            with marked_timer("ref", timing_raw, color="olive"):
+                ref_infer_res = self._compute_ref_noise_pred(data)
+                if ref_infer_res is not None:
+                    data = data.union(ref_infer_res)
+
+        with marked_timer("update_actor", timing_raw, color="red"):
+            actor_output = self._update_actor(data)
+            actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+            metrics.update(actor_metrics)
+            if self._has_old_adapter:
+                metrics.update(compute_old_policy_metrics(self._update_old_policy()))
+
+        return batch_meta
+
+    def on_init_end(self):
+        """Called after initialization ends."""
+        return
+
+    def on_train_begin(self):
+        """Called before the training loop starts."""
+        return
+
+    def on_train_end(self):
+        """Called after the training loop ends."""
+        return
+
+    def on_validate_begin(self):
+        """Called before validation."""
+        return
+
+    def on_validate_end(self):
+        """Called after validation."""
+        return
+
+    def on_step_begin(self):
+        """Called at the beginning of each training step."""
+        return
+
+    def _should_prefetch_local_batches(self) -> bool:
+        """Whether to collect the full parameter-sync cycle before training."""
+        return False
+
+    def on_sample_begin(self):
+        """Called at the beginning of sampling from the replay buffer."""
+        return
+
+    @abstractmethod
+    def on_step_end(self):
+        """Called at the end of each training step."""
+        return
+
+    def _consume_sync_metrics(self) -> dict:
+        """Weight-sync stats stashed by ``on_step_end``, merged into this step's logged metrics."""
+        metrics = getattr(self, "_pending_sync_metrics", None) or {}
+        self._pending_sync_metrics = {}
+        return metrics
+
+    @abstractmethod
+    def on_sample_end(self):
+        """Called after sampling a batch from the replay buffer."""
+        return
+
+    def _get_n_gpus_for_throughput(self) -> int:
+        """Return the total number of GPUs used for throughput normalization."""
+        return self.resource_pool_manager.get_n_gpus()
+
+    def release_rollout_cache_for_weight_sync(self) -> None:
+        """No-op for pure diffusion models (no KV cache)."""
+        return
+
+    def resume_rollout_cache_after_weight_sync(self) -> None:
+        """No-op for pure diffusion models (no KV cache)."""
+        return
+
+    def _setup(self):
+        self._init_tokenizer()
+        self._init_dataloader()
+        self._init_dump_executor()
+        self._init_resource_pool_mgr()
+        self.resource_pool_manager.create_resource_pool()
+        self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
+        self._normalize_dynamic_bsz_config()
+
+        actor_rollout_resource_pool = self._init_colocated_workers()
+        self._init_online_rollout_stack(actor_rollout_resource_pool)
+        self.checkpoint_manager.sleep_replicas()
+        self._load_checkpoint()
+
+        logger.info("diffusion v1 trainer initialized, ready to fit")
+
+    def _init_tokenizer(self):
+        import json
+
+        from verl.utils import hf_processor, hf_tokenizer
+
+        from verl_omni.utils.fs import resolve_model_local_dir
+
+        local_path = resolve_model_local_dir(
+            self.config.actor_rollout_ref.model.path,
+            use_shm=self.config.actor_rollout_ref.model.get("use_shm", False),
+        )
+        trust_remote_code = self.config.data.get("trust_remote_code", False)
+
+        if self.config.actor_rollout_ref.model.tokenizer_path is None:
+            tokenizer_path = os.path.join(local_path, "tokenizer")
+            self.config.actor_rollout_ref.model.tokenizer_path = (
+                tokenizer_path if os.path.exists(tokenizer_path) else local_path
+            )
+        self.tokenizer = hf_tokenizer(
+            self.config.actor_rollout_ref.model.tokenizer_path, trust_remote_code=trust_remote_code
+        )
+
+        # Resolve the diffusion architecture and let the pipeline adapter prepare
+        # processor files before loading the processor (mirrors main_diffusion.py).
+        model_config = self.config.actor_rollout_ref.model
+        architecture = model_config.get("architecture")
+        if architecture is None:
+            model_index_path = os.path.join(local_path, "model_index.json")
+            try:
+                with open(model_index_path) as model_index_file:
+                    architecture = json.load(model_index_file)["_class_name"]
+            except (OSError, KeyError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"Unable to infer the diffusion architecture from {model_index_path}. "
+                    "Set actor_rollout_ref.model.architecture explicitly."
+                ) from exc
+
+        from verl_omni.pipelines.model_base import DiffusionModelBase
+
+        prepared_processor_path = DiffusionModelBase.get_class_by_name(
+            architecture,
+            model_config.algorithm,
+            model_config.get("external_lib"),
+        ).prepare_processor_files(local_path)
+        processor_path = os.path.join(local_path, "processor")
+        if prepared_processor_path is not None:
+            processor_path = prepared_processor_path
+        if not os.path.exists(processor_path):
+            processor_path = local_path
+        self.processor = hf_processor(processor_path, trust_remote_code=trust_remote_code, use_fast=True)
+
+    def _normalize_dynamic_bsz_config(self) -> None:
+        actor_cfg = OmegaConf.select(self.config, "actor_rollout_ref.actor")
+        rollout_cfg = OmegaConf.select(self.config, "actor_rollout_ref.rollout")
+        if actor_cfg is None or rollout_cfg is None:
+            return
+
+        rollout_dynamic_bsz = OmegaConf.select(self.config, "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz")
+        rollout_max_tokens = OmegaConf.select(self.config, "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu")
+
+        with open_dict(self.config):
+            if rollout_dynamic_bsz is None:
+                self.config.actor_rollout_ref.rollout.log_prob_use_dynamic_bsz = False
+            if rollout_max_tokens is None:
+                self.config.actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu = 16384
+
+    def _init_dataloader(self):
+        from verl_omni.utils.dataset.rl_dataset import (
+            create_rl_dataset,
+            create_rl_sampler,
+            get_collate_fn,
+        )
+
+        self.train_dataset = create_rl_dataset(
+            self.config.data.train_files,
+            self.config.data,
+            self.tokenizer,
+            self.processor,
+            max_samples=self.config.data.get("train_max_samples", -1),
+        )
+        self.val_dataset = create_rl_dataset(
+            self.config.data.val_files,
+            self.config.data,
+            self.tokenizer,
+            self.processor,
+            max_samples=self.config.data.get("val_max_samples", -1),
+        )
+
+        gen_batch_size = self._generation_batch_size()
+        self.train_dataloader = StatefulDataLoader(
+            dataset=self.train_dataset,
+            batch_size=gen_batch_size,
+            num_workers=self.config.data["dataloader_num_workers"],
+            drop_last=True,
+            collate_fn=get_collate_fn(self.config.data),
+            sampler=create_rl_sampler(self.config.data, self.train_dataset),
+        )
+        self.train_dataloader_it = None
+        # Per-run monotonic generation-batch number; pairs with the batch-local
+        # ``index`` so TQ row ordering survives multi-batch sampling paths.
+        self._gen_batch_seq = 0
+        val_batch_size = self.config.data.val_batch_size or len(self.val_dataset)
+        self.val_dataloader = StatefulDataLoader(
+            dataset=self.val_dataset,
+            batch_size=val_batch_size,
+            num_workers=self.config.data["dataloader_num_workers"],
+            shuffle=self.config.data.get("validation_shuffle", True),
+            drop_last=False,
+            collate_fn=get_collate_fn(self.config.data),
+        )
+
+        self.steps_per_epoch = len(self.train_dataset) // self.config.data.train_batch_size
+        total_training_steps = self.steps_per_epoch * self.config.trainer.total_epochs
+        if self.config.trainer.total_training_steps is not None:
+            total_training_steps = self.config.trainer.total_training_steps
+        self.total_training_steps = total_training_steps
+        logger.info(f"Total diffusion training steps: {self.total_training_steps}")
+
+        try:
+            OmegaConf.set_struct(self.config, True)
+            with open_dict(self.config):
+                if OmegaConf.select(self.config, "actor_rollout_ref.actor.optim"):
+                    self.config.actor_rollout_ref.actor.optim.total_training_steps = (
+                        total_training_steps * self.parameter_sync_step
+                    )
+        except (KeyError, TypeError, AttributeError, OmegaConf.errors.OmegaConfBaseException) as e:
+            raise RuntimeError("Failed to propagate trainer.total_training_steps to actor optimizer config.") from e
+
+    def _init_dump_executor(self):
+        self._dump_executor = ThreadPoolExecutor(max_workers=1)
+        self._dump_futures = []
+
+    @staticmethod
+    def _report_dump_failure(future, global_step: int) -> None:
+        """Log a completed media-dump failure without interrupting training."""
+        try:
+            future.result()
+        except Exception as error:
+            logger.warning(
+                "Ignoring background media dump failure at step %s: %s",
+                global_step,
+                error,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    def _drain_dump_futures(self) -> None:
+        still_pending = []
+        for future, global_step in self._dump_futures:
+            if future.done():
+                self._report_dump_failure(future, global_step)
+            else:
+                still_pending.append((future, global_step))
+        self._dump_futures = still_pending
+
+    def _shutdown_dump_executor(self):
+        self._dump_executor.shutdown(wait=True)
+        for future, global_step in self._dump_futures:
+            self._report_dump_failure(future, global_step)
+        self._dump_futures.clear()
+
+    def _shutdown_dataloaders(self):
+        for attr in ("train_dataloader", "val_dataloader"):
+            loader = getattr(self, attr, None)
+            if loader is None:
+                continue
+            iterator = getattr(loader, "_iterator", None)
+            if iterator is None:
+                # name-mangled private iterator in some torch versions
+                iterator = getattr(loader, "_DataLoader__iterator", None)
+            shutdown = getattr(iterator, "_shutdown_workers", None)
+            if callable(shutdown):
+                try:
+                    shutdown()
+                except Exception as e:
+                    logger.debug(f"Ignoring error shutting down {attr} workers: {e}")
+            # Drop references so the implicit __del__ during teardown is a no-op
+            try:
+                loader._iterator = None
+            except Exception:
+                pass
+        self.train_dataloader_it = None
+
+    def _init_resource_pool_mgr(self):
+        self.role_worker_mapping = {}
+        self.mapping = {}
+        role = Role.ActorRolloutRef if self.use_reference_policy and not self.ref_in_actor else Role.ActorRollout
+        self.role_worker_mapping[role] = ray.remote(ActorRolloutRefWorker)
+        self.mapping[role] = "global_pool"
+
+        global_pool_id = "global_pool"
+        resource_pool_spec = {global_pool_id: [self.config.trainer.n_gpus_per_node] * self.config.trainer.nnodes}
+
+        if reward_role_required(self.config) and reward_pool_is_separate(self.config):
+            reward_gpus = self.config.reward.reward_model.n_gpus_per_node
+            reward_nnodes = self.config.reward.reward_model.nnodes
+            reward_pool = [reward_gpus] * reward_nnodes
+            resource_pool_spec["reward_pool"] = reward_pool
+            self.mapping[Role.RewardModel] = "reward_pool"
+        else:
+            if reward_role_required(self.config):
+                self.config.reward.reward_model.nnodes = self.config.trainer.nnodes
+                self.config.reward.reward_model.n_gpus_per_node = self.config.trainer.n_gpus_per_node
+            if reward_role_required(self.config):
+                self.mapping[Role.RewardModel] = "global_pool"
+
+        if self.use_teacher_policy and self.distillation_config.nnodes > 0:
+            if self.distillation_config.n_gpus_per_node <= 0:
+                raise ValueError("config.distillation.n_gpus_per_node must be greater than 0")
+            self.role_worker_mapping[Role.TeacherModel] = ray.remote(ActorRolloutRefWorker)
+            self.mapping[Role.TeacherModel] = "teacher_pool"
+            resource_pool_spec["teacher_pool"] = [
+                self.distillation_config.n_gpus_per_node
+            ] * self.distillation_config.nnodes
+        self.resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
+
+    def _init_colocated_workers(self):
+        """Create the colocated actor/ref worker group (diffusion has no critic)."""
+        actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
+        actor_rollout_resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
+        actor_rollout_cls = RayClassWithInitArgs(
+            cls=self.role_worker_mapping[actor_role],
+            config=self.config.actor_rollout_ref,
+            distillation_config=self.config.get("distillation"),
+            role=str(actor_role),
+        )
+        self.resource_pool_to_cls[actor_rollout_resource_pool][str(actor_role)] = actor_rollout_cls
+
+        # standalone teachers: one sub-pool and worker group per teacher
+        if self.use_teacher_policy and Role.TeacherModel in self.role_worker_mapping:
+            teacher_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
+            teacher_models = self.distillation_config.teacher_models
+            split_pools = split_resource_pool(teacher_pool, split_size=[t.world_size for t in teacher_models.values()])
+            for key, pool in zip(teacher_models, split_pools, strict=True):
+                self.resource_pool_to_cls[pool] = {
+                    self._teacher_wg_name(key): RayClassWithInitArgs(
+                        self.role_worker_mapping[Role.TeacherModel],
+                        config=self.config.actor_rollout_ref,
+                        distillation_config=self.config.get("distillation"),
+                        role=str(Role.TeacherModel),
+                        teacher_key=key,
+                    )
+                }
+
+        all_wg = {}
+        wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
+        if OmegaConf.select(self.config.global_profiler, "steps") is not None:
+            wg_kwargs["profile_steps"] = OmegaConf.select(self.config.global_profiler, "steps")
+            # Only require nsight worker options when tool is nsys
+            if OmegaConf.select(self.config.global_profiler, "tool") == "nsys":
+                assert (
+                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                    is not None
+                ), "worker_nsight_options must be set when using nsys with profile_steps"
+                wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
+                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                )
+        wg_kwargs["device_name"] = self.config.trainer.device
+        pools = [(pool, class_dict) for pool, class_dict in self.resource_pool_to_cls.items() if class_dict]
+        master_port_range = OmegaConf.select(self.config.trainer, "ray_master_port_range")
+        port_ranges = worker_group_port_ranges(master_port_range, len(pools))
+        for (resource_pool, class_dict), port_range in zip(pools, port_ranges, strict=True):
+            if port_range is not None:
+                wg_kwargs["master_port_range"] = port_range
+            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+            wg_dict = RayWorkerGroup(resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls, **wg_kwargs)
+            spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+            all_wg.update(spawn_wg)
+
+        self.actor_rollout_wg = all_wg[str(actor_role)]
+        self.actor_rollout_wg.init_model()
+        if self.use_reference_policy and not self.ref_in_actor:
+            self.ref_policy_wg = self.actor_rollout_wg
+        if self.ref_in_actor:
+            self.ref_policy_wg = self.actor_rollout_wg
+
+        if self.use_teacher_policy:
+            if Role.TeacherModel in self.role_worker_mapping:
+                teacher_wg = {
+                    key: all_wg[self._teacher_wg_name(key)] for key in self.distillation_config.teacher_models
+                }
+                for wg in teacher_wg.values():
+                    wg.init_model()
+            else:
+                teacher_wg = {key: self.actor_rollout_wg for key in self.distillation_config.teacher_models}
+            self.teacher_model_manager = DiffusionTeacherManager(
+                self.distillation_config,
+                self.config.actor_rollout_ref.model,
+                teacher_wg,
+                infer_micro_batch_size_per_gpu=resolve_teacher_infer_micro_batch_size(self.config.actor_rollout_ref),
+            )
+
+        return actor_rollout_resource_pool
+
+    @staticmethod
+    def _teacher_wg_name(key: str) -> str:
+        return f"teacher_{key.replace('/', '_')}"
+
+    def _init_online_rollout_stack(self, actor_rollout_resource_pool):
+        """Initialize reward loop, LLM server, and checkpoint engine managers."""
+        from verl_omni.reward_loop import OmniRewardLoopManager
+
+        resource_pool = (
+            self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+            if reward_role_required(self.config)
+            else None
+        )
+        self.reward_loop_manager = OmniRewardLoopManager(
+            config=self.config,
+            rm_resource_pool=resource_pool,
+            accelerator_resource_pool=actor_rollout_resource_pool,
+        )
+
+        # Streaming agent reward loop when there is no rm, or the rm has a separate pool.
+        self.enable_agent_reward_loop = streaming_reward_enabled(self.config)
+
+        self.llm_server_manager = LLMServerManager.create(
+            config=self.config,
+            worker_group=self.actor_rollout_wg,
+            rollout_resource_pool=actor_rollout_resource_pool,
+        )
+
+        checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
+        self.checkpoint_manager = CheckpointEngineManager(
+            config=checkpoint_engine_config,
+            actor_wg=self.actor_rollout_wg,
+            replicas=self.llm_server_manager.get_replicas(),
+        )
+
+    def get_llm_client(self):
+        return self.llm_server_manager.get_client()
+
+    def get_reward_handles(self):
+        if self.enable_agent_reward_loop:
+            return self.reward_loop_manager.reward_loop_workers
+        return None
+
+    def _fetch_one_gen_batch(self):
+        if self.train_dataloader_it is None:
+            self.train_dataloader_it = iter(self.train_dataloader)
+        try:
+            batch_dict = next(self.train_dataloader_it)
+        except StopIteration:
+            self.train_dataloader_it = iter(self.train_dataloader)
+            batch_dict = next(self.train_dataloader_it)
+
+        batch_dict["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object)
+        batch_dict["index"] = np.arange(len(batch_dict["raw_prompt"]))
+        batch_dict["gen_batch_seq"] = np.full(len(batch_dict["raw_prompt"]), self._gen_batch_seq)
+        self._gen_batch_seq += 1
+        return tu.get_tensordict(batch_dict)
+
+    def _generation_batch_size(self) -> int:
+        cached_batch_size = getattr(self, "_effective_generation_batch_size", None)
+        if cached_batch_size is not None:
+            return cached_batch_size
+
+        sampler_config = self.config.trainer.v1.sampler
+        exact_refill = sampler_config.get("drop_incomplete_groups", False) or self.trainer_mode == "separate_async"
+        if exact_refill:
+            configured_batch_size = self.config.data.get("gen_batch_size", None)
+            if configured_batch_size not in (None, 1):
+                logger.warning(
+                    "data.gen_batch_size=%s is overridden to 1 because exact replay-buffer refill is enabled",
+                    configured_batch_size,
+                )
+            effective_batch_size = 1
+        else:
+            effective_batch_size = self.config.data.get("gen_batch_size", None) or self.config.data.train_batch_size
+        self._effective_generation_batch_size = effective_batch_size
+        return effective_batch_size
+
+    def _next_train_batch(self, num_prompts: int | None = None) -> tu.TensorDict:
+        train_batch_size = self.config.data.train_batch_size
+        if num_prompts is None:
+            num_prompts = train_batch_size
+        gen_batch_size = self._generation_batch_size()
+        if num_prompts <= 0 or num_prompts % gen_batch_size != 0:
+            raise ValueError(
+                f"num_prompts ({num_prompts}) must be a positive multiple of gen_batch_size ({gen_batch_size})"
+            )
+        chunks = [self._fetch_one_gen_batch() for _ in range(num_prompts // gen_batch_size)]
+        batch = chunks[0] if len(chunks) == 1 else tu.concat_tensordict(chunks)
+        tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
+        rollout_seed_cfg = self.config.actor_rollout_ref.rollout.get("seed")
+        if rollout_seed_cfg is not None:
+            tu.assign_non_tensor_data(batch, "rollout_seed", int(rollout_seed_cfg) + self.global_steps - 1)
+        return batch
+
+    @staticmethod
+    def _trajectory_uid(key: str) -> str:
+        parts = key.rsplit("_", 2)
+        return parts[0] if len(parts) == 3 else key
+
+    def _sample_training_batch(self, batch_size: int) -> tuple[KVBatchMeta, dict]:
+        """Use the upstream replay buffer and replace only selected failed groups."""
+        sampler_config = self.config.trainer.v1.sampler
+        if not sampler_config.get("drop_incomplete_groups", False):
+            batch_meta, off_policy_metrics = self.replay_buffer.sample(
+                global_steps=self.global_steps,
+                partition_id="train",
+                batch_size=batch_size,
+            )
+            # Restore the v0 prompt-major row order before any consumer reads
+            # or writes these keys (TQ key order is storage-arbitrary).
+            return canonicalize_diffusion_tq_meta(batch_meta), off_policy_metrics
+
+        max_refill_rounds = sampler_config.get("max_incomplete_group_refill_rounds", 3)
+        remaining_batch_size = batch_size
+        refill_rounds = 0
+        keys: list[str] = []
+        tags: list[dict] = []
+        sampling_metrics: dict = {}
+        failure_metrics: Counter = Counter()
+
+        while remaining_batch_size > 0:
+            try:
+                batch, current_metrics = self.replay_buffer.sample(
+                    global_steps=self.global_steps,
+                    partition_id="train",
+                    batch_size=remaining_batch_size,
+                )
+            except RuntimeError as e:
+                if "Sync replay buffer selected terminal groups with no materializable trajectories" in str(
+                    e
+                ) and "sync_refill_failed_groups" in str(e):
+                    batch = KVBatchMeta(partition_id="train", keys=[], tags=[])
+                    current_metrics = {}
+                else:
+                    raise
+            sampling_metrics.update(current_metrics)
+
+            prompt_global_steps = self.replay_buffer.prompt_global_steps["train"]
+            sampleable_uids = sorted(
+                self.replay_buffer.finished_keys["train"] | self.replay_buffer.failure_keys["train"],
+                key=lambda uid: prompt_global_steps.get(uid, 0),
+            )
+            selected_uids = set(sampleable_uids[:remaining_batch_size])
+            failed_uids = selected_uids & self.replay_buffer.failure_keys["train"]
+            if not failed_uids:
+                keys.extend(batch.keys)
+                tags.extend(batch.tags)
+                break
+
+            if refill_rounds >= max_refill_rounds:
+                raise RuntimeError(
+                    f"Exceeded max_incomplete_group_refill_rounds={max_refill_rounds} "
+                    "while replacing failed rollout groups"
+                )
+
+            num_failed = len(failed_uids)
+            for key, tag in zip(batch.keys, batch.tags, strict=False):
+                if self._trajectory_uid(key) not in failed_uids:
+                    keys.append(key)
+                    tags.append(tag)
+
+            failed_trajectory_keys = [
+                key for key in self.replay_buffer.partitions["train"] if self._trajectory_uid(key) in failed_uids
+            ]
+            tq.kv_clear(partition_id="train", keys=[*failed_uids, *failed_trajectory_keys])
+
+            refilled = self._add_prompts_to_generate(num_failed)
+            if refilled != num_failed:
+                raise RuntimeError(f"refill submitted {refilled} prompts, expected {num_failed}")
+
+            refill_rounds += 1
+            remaining_batch_size = num_failed
+            failure_metrics["training/rollout_failure/evicted_groups"] += num_failed
+            failure_metrics["training/rollout_failure/evicted_trajectories"] += len(failed_trajectory_keys)
+            failure_metrics["training/rollout_failure/refilled_prompts"] += refilled
+            failure_metrics["training/rollout_failure/refill_rounds"] += 1
+            logger.warning(
+                "Evicted %d incomplete rollout groups and submitted exact replacements (round %d/%d)",
+                num_failed,
+                refill_rounds,
+                max_refill_rounds,
+            )
+
+        return canonicalize_diffusion_tq_meta(KVBatchMeta(partition_id="train", keys=keys, tags=tags)), {
+            **sampling_metrics,
+            **failure_metrics,
+        }
+
+    def _submit_batch_to_rollout(self, batch) -> int:
+        tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))]
+        if self.trainer_mode != "sync":
+            from tensordict.tensorclass import NonTensorData
+
+            tq.kv_batch_put(
+                keys=list(batch["uid"]),
+                partition_id="train",
+                tags=tags,
+                fields=batch.select(*[k for k in batch.keys() if not isinstance(batch.get(k), NonTensorData)]),
+            )
+        else:
+            tq.kv_batch_put(keys=list(batch["uid"]), partition_id="train", tags=tags)
+        self.agent_loop_manager.generate_sequences(batch)
+        return len(batch)
+
+    def _add_prompts_to_generate(self, num_prompts: int) -> int:
+        batch = self._next_train_batch(num_prompts)
+        return self._submit_batch_to_rollout(batch)
+
+    def _add_batch_to_generate(self):
+        batch = self._next_train_batch()
+        self._submit_batch_to_rollout(batch)
+
+    def _compute_reward_colocate(self, data: DataProto) -> DataProto:
+        """Compute reward score with a colocated reward model on a DataProto batch."""
+        assert self.reward_loop_manager is not None, "RewardLoopManager is None"
+        return self.reward_loop_manager.compute_rm_score(data)
+
+    def _balance_batch(self, data: DataProto, metrics: dict) -> DataProto:
+        dp_size = 1
+        if hasattr(self.actor_rollout_wg, "_query_dispatch_info"):
+            info = self.actor_rollout_wg._query_dispatch_info("actor")
+            if isinstance(info, dict):
+                dp_size = max(info.values()) + 1 if info else 1
+            elif isinstance(info, list | tuple | set):
+                dp_size = max(info) + 1 if info else 1
+            else:
+                # ONE_TO_ALL dispatch may return a scalar dp rank per worker.
+                dp_size = int(info) + 1 if info is not None else 1
+        actor_global_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+        actor_global_mini_batch_size *= self.config.actor_rollout_ref.rollout.n
+        if self.trainer_mode == "separate_async":
+            if len(data) != actor_global_mini_batch_size:
+                raise ValueError(
+                    "separate_async local batch must contain exactly "
+                    f"ppo_mini_batch_size * rollout.n = {actor_global_mini_batch_size} trajectories, "
+                    f"but received {len(data)}; refusing to pad copied trajectories"
+                )
+            if len(data) % dp_size != 0:
+                raise ValueError(
+                    f"separate_async local batch size {len(data)} must be divisible by actor DP size {dp_size}"
+                )
+            return data
+
+        batch_multiple = math.lcm(dp_size, actor_global_mini_batch_size)
+        if len(data) % batch_multiple != 0:
+            # pad_dataproto_to_divisor pads by duplicating real rows, which would
+            # carry real advantages into the unmasked FlowGRPO loss mean and bias
+            # the gradient. Mark the duplicated tail so its advantages can be zeroed
+            # before the actor update (see _zero_pad_row_advantages).
+            data, pad_size = pad_dataproto_to_divisor(data, size_divisor=batch_multiple)
+            is_pad = np.zeros(len(data), dtype=bool)
+            is_pad[-pad_size:] = True
+            data.non_tensor_batch["_balance_is_pad"] = is_pad
+        return data
+
+    def _zero_pad_row_advantages(self, data: DataProto) -> DataProto:
+        """Zero advantages of rows appended by ``_balance_batch``.
+
+        ``_compute_advantage`` recomputes advantages, so this must run after it.
+        Pad rows then contribute nothing to the unmasked ``torch.mean`` loss.
+        No-op when no padding occurred.
+        """
+        is_pad = data.non_tensor_batch.pop("_balance_is_pad", None)
+        if is_pad is None or not is_pad.any():
+            return data
+        advantages = data.batch["advantages"]
+        is_pad = torch.from_numpy(is_pad).to(advantages.device)
+        advantages[is_pad] = 0.0
+        return data
+
+    def _compute_old_log_prob(self, data: DataProto) -> DataProto:
+        """Recompute old log-probs over diffusion latents with the actor engine."""
+        batch_td = _to_diffusion_worker_tensordict(data)
+        batch_td = embeds_padding_2_no_padding(batch_td)
+        tu.assign_non_tensor(
+            batch_td,
+            compute_loss=False,
+            height=self.config.actor_rollout_ref.model.pipeline.height,
+            width=self.config.actor_rollout_ref.model.pipeline.width,
+            vae_scale_factor=self.config.actor_rollout_ref.model.get("vae_scale_factor", 8),
+        )
+        output = self.actor_rollout_wg.infer_actor_batch(batch_td)
+        log_probs = tu.get(output, "log_probs")
+        if log_probs is None:
+            raise RuntimeError(
+                "Actor infer_actor_batch returned log_probs=None. Direct-preference "
+                "algorithms (DPO / DiffusionNFT) must set algorithm.trainer_type="
+                "direct_preference so the trainer skips old-log-prob recomputation."
+            )
+        old_log_prob_dict = {"old_log_probs": log_probs.float()}
+        prev_sample_mean = tu.get(output, "prev_sample_mean")
+        if prev_sample_mean is not None:
+            old_log_prob_dict["old_prev_sample_mean"] = prev_sample_mean.float()
+        old_log_prob = DataProto.from_tensordict(tu.get_tensordict(old_log_prob_dict))
+        if (mfu := tu.get(output, "metrics").pop("mfu", None)) is not None:
+            old_log_prob.meta_info["metrics"] = {"perf/mfu/actor_infer": mfu}
+        return old_log_prob
+
+    def _compute_ref_log_prob(self, data: DataProto) -> DataProto:
+        """Compute reference log-probs over diffusion latents."""
+        batch_td = _to_diffusion_worker_tensordict(data)
+        batch_td = embeds_padding_2_no_padding(batch_td)
+        metadata = {
+            "compute_loss": False,
+            "height": self.config.actor_rollout_ref.model.pipeline.height,
+            "width": self.config.actor_rollout_ref.model.pipeline.width,
+            "vae_scale_factor": self.config.actor_rollout_ref.model.get("vae_scale_factor", 8),
+        }
+        if self.ref_in_actor:
+            metadata["no_lora_adapter"] = True
+        tu.assign_non_tensor(batch_td, **metadata)
+        if self.ref_in_actor:
+            output = self.actor_rollout_wg.infer_actor_batch(batch_td)
+        else:
+            output = self.ref_policy_wg.infer_ref_batch(batch_td)
+        log_probs = tu.get(output, "log_probs")
+        prev_sample_mean = tu.get(output, "prev_sample_mean")
+        ref_dict = {"ref_log_prob": log_probs.float()}
+        if prev_sample_mean is not None:
+            ref_dict["ref_prev_sample_mean"] = prev_sample_mean.float()
+        return DataProto.from_tensordict(tu.get_tensordict(ref_dict))
+
+    def _compute_advantage(self, data: DataProto) -> DataProto:
+        """Compute diffusion (Flow-GRPO) advantages on the driver."""
+        reward_tensor, reward_extra_infos_dict = extract_reward(data)
+        data.batch["sample_level_scores"] = reward_tensor
+        if reward_extra_infos_dict:
+            data.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+        num_timesteps = data.batch["all_timesteps"].shape[1]
+        data.batch["sample_level_rewards"] = data.batch["sample_level_scores"].expand(-1, num_timesteps)
+
+        norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
+        data = compute_advantage(
+            data,
+            adv_estimator=self.config.algorithm.adv_estimator,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            global_std=self.config.algorithm.global_std,
+            config=self.config.algorithm,
+        )
+        return data
+
+    def _update_actor(self, data: DataProto) -> DataProto:
+        """Update the diffusion actor network."""
+        rollout_config = self.config.actor_rollout_ref.rollout
+        data.meta_info["multi_turn"] = rollout_config.multi_turn.enable
+        batch_td = _to_diffusion_worker_tensordict(data)
+        batch_td = embeds_padding_2_no_padding(batch_td)
+        ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+        paired = bool(self.config.algorithm.get("paired_preference", False)) and getattr(
+            self, "_is_direct_preference", False
+        )
+        if paired:
+            ppo_mini_batch_size = ppo_mini_batch_size * 2
+        else:
+            ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
+        seed = self.config.actor_rollout_ref.actor.data_loader_seed
+        shuffle = self.config.actor_rollout_ref.actor.shuffle
+        loss_mode = OmegaConf.select(self.config, "actor_rollout_ref.actor.diffusion_loss.loss_mode")
+        keep_groups = paired or (loss_mode is not None and get_diffusion_loss_fn(loss_mode).requires_whole_groups)
+        if keep_groups and shuffle:
+            logger.warning(
+                "Shuffle is not supported for direct preference during actor update."
+                "This is to prevent chosen/rejected pairs and rollout groups from being split across "
+                "different micro batches."
+                "Setting shuffle to False."
+            )
+            shuffle = False
+        tu.assign_non_tensor(
+            batch_td,
+            global_batch_size=ppo_mini_batch_size,
+            mini_batch_size=ppo_mini_batch_size,
+            epochs=ppo_epochs,
+            seed=seed,
+            dataloader_kwargs={"shuffle": shuffle},
+            height=self.config.actor_rollout_ref.model.pipeline.height,
+            width=self.config.actor_rollout_ref.model.pipeline.width,
+            vae_scale_factor=self.config.actor_rollout_ref.model.get("vae_scale_factor", 8),
+        )
+        actor_output = self.actor_rollout_wg.update_actor(batch_td)
+        actor_output = tu.get(actor_output, "metrics")
+        actor_output = rename_dict(actor_output, "actor/")
+        if (actor_mfu := actor_output.pop("actor/mfu", None)) is not None:
+            actor_output["perf/mfu/actor"] = actor_mfu
+        return DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
+
+    def _validate(self) -> dict:
+        """Validation via TransferQueue: dispatch, sample, convert, reward, dump media."""
+        sample_inputs: list[str] = []
+        sample_outputs: list[torch.Tensor] = []
+        sample_audios: list = []
+        sample_audio_sample_rates: list = []
+        sample_media_kinds: list = []
+        sample_previews: list = []
+        sample_gts: list = []
+        sample_scores: list[float] = []
+        sample_turns: list = []
+        sample_uids: list = []
+        data_sources: list = []
+        reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+
+        for batch_dict in self.val_dataloader:
+            batch_dict["uid"] = np.array(
+                [str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object
+            )
+            batch_dict["index"] = np.arange(len(batch_dict["raw_prompt"]))
+            batch_dict["gen_batch_seq"] = np.full(len(batch_dict["raw_prompt"]), self._gen_batch_seq)
+            self._gen_batch_seq += 1
+            batch = tu.get_tensordict(batch_dict)
+            tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
+            tu.assign_non_tensor_data(batch, "validate", True)
+            tags = [
+                {"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))
+            ]
+            tq.kv_batch_put(keys=list(batch["uid"]), partition_id="val", tags=tags)
+            self.agent_loop_manager.generate_sequences(batch)
+
+            batch_meta, _ = self.replay_buffer.sample(
+                global_steps=self.global_steps, partition_id="val", batch_size=len(batch)
+            )
+            batch_meta = canonicalize_diffusion_tq_meta(batch_meta)
+            # Full payload on purpose: the colocated reward model receives this
+            # DataProto and may read any pipeline-emitted row field.
+            data = diffusion_tq_batch_to_dataproto(batch_meta, pad_token_id=self.tokenizer.pad_token_id or 0)
+
+            # Skip empty validation batches (e.g. all trajectories were dropped
+            # by the off-policy sampler) instead of crashing on downstream
+            # tensor indexing with batch_size=0.
+            if len(data) == 0:
+                logger.warning(
+                    "Validation produced no trajectories for this batch (step=%d); skipping.",
+                    self.global_steps,
+                )
+                tq.kv_clear(keys=batch_meta.keys, partition_id=batch_meta.partition_id)
+                continue
+
+            if self.use_rm and self.reward_loop_manager.reward_loop_worker_handles is None:
+                self.checkpoint_manager.sleep_replicas()
+                data = data.union(self._compute_reward_colocate(data))
+                self.checkpoint_manager.update_weights(self.global_steps)
+
+            input_ids = data.batch["prompts"]
+            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            output_images = data.batch["responses"]
+            # Distinguish real generations from aborted/empty ones so the
+            # trainer logs clearly whether validation produced real images.
+            num_real = (
+                int(output_images.numel() > 0 and output_images.shape[-1] > 0)
+                if isinstance(output_images, torch.Tensor)
+                else 0
+            )
+            logger.info(
+                "Validation batch (step=%d): %d trajectories, responses shape=%s, real_media=%s",
+                self.global_steps,
+                len(data),
+                tuple(output_images.shape) if isinstance(output_images, torch.Tensor) else None,
+                num_real,
+            )
+            sample_inputs.extend(input_texts)
+            sample_outputs.append(output_images)
+            sample_previews.extend(previews_from_batch(data) or [None] * len(output_images))
+            tool_extra = data.non_tensor_batch.get("tool_extra_fields")
+            sample_audios.extend(_resolve_rollout_media_field(data, tool_extra, "audio"))
+            sample_audio_sample_rates.extend(_resolve_rollout_media_field(data, tool_extra, "audio_sample_rate"))
+            sample_media_kinds.extend(_resolve_rollout_media_field(data, tool_extra, "media_kind"))
+            uids = data.non_tensor_batch.get("uid")
+            sample_uids.extend(list(uids) if uids is not None else [None] * len(data))
+
+            reward_tensor, reward_extra_info = extract_reward(data)
+            scores = reward_tensor.sum(-1).cpu().tolist()
+            sample_scores.extend(scores)
+            reward_extra_infos_dict["reward"].extend(scores)
+            for key, values in reward_extra_info.items():
+                if isinstance(values, np.ndarray):
+                    reward_extra_infos_dict[key].extend(values.tolist())
+                else:
+                    reward_extra_infos_dict[key].extend(values if isinstance(values, list) else [values])
+
+            if "__num_turns__" in data.non_tensor_batch:
+                sample_turns.append(data.non_tensor_batch["__num_turns__"])
+            data_sources.append(data.non_tensor_batch.get("data_source", ["unknown"] * len(data)))
+
+            rm_meta = data.non_tensor_batch.get("reward_model")
+            if rm_meta is not None:
+                sample_gts.extend([item.get("ground_truth", None) for item in rm_meta.tolist()])
+            else:
+                sample_gts.extend([None] * len(data))
+
+            tq.kv_clear(keys=batch_meta.keys, partition_id=batch_meta.partition_id)
+
+        sample_outputs = torch.cat(sample_outputs, dim=0) if sample_outputs else torch.empty(0)
+        self._maybe_log_val_generations(
+            inputs=sample_inputs,
+            outputs=sample_outputs,
+            scores=sample_scores,
+            audios=sample_audios,
+            audio_sample_rates=sample_audio_sample_rates,
+            media_kinds=sample_media_kinds,
+            previews=sample_previews,
+        )
+
+        val_data_dir = self.config.trainer.get("validation_data_dir", None)
+        if val_data_dir and len(sample_outputs) > 0:
+            self._dump_generations(
+                inputs=sample_inputs,
+                outputs=sample_outputs,
+                gts=sample_gts,
+                scores=sample_scores,
+                reward_extra_infos_dict=reward_extra_infos_dict,
+                dump_path=val_data_dir,
+                max_samples=self.config.trainer.get("validation_data_max_samples", None),
+                fps=int(self.config.trainer.get("video_fps", 24)),
+                audios=sample_audios,
+                audio_sample_rates=sample_audio_sample_rates,
+                media_kind=resolve_batch_media_kind(sample_media_kinds),
+                previews=sample_previews,
+            )
+
+        data_sources_arr = np.concatenate(data_sources, axis=0) if data_sources else np.array([])
+        return self._val_metrics_update(data_sources_arr, sample_uids, reward_extra_infos_dict, sample_turns)
+
+    def _maybe_log_val_generations(
+        self,
+        inputs,
+        outputs,
+        scores,
+        audios=None,
+        audio_sample_rates=None,
+        media_kinds=None,
+        previews=None,
+    ):
+        """Use the shared image/video W&B path with declared media metadata."""
+        return BaseRayDiffusionTrainer._maybe_log_val_generations(
+            self,
+            inputs,
+            outputs,
+            scores,
+            audios=audios,
+            audio_sample_rates=audio_sample_rates,
+            media_kinds=media_kinds,
+            previews=previews,
+        )
+
+    def _dump_generations(
+        self,
+        inputs,
+        outputs,
+        gts,
+        scores,
+        reward_extra_infos_dict,
+        dump_path,
+        max_samples=None,
+        fps=24,
+        audios=None,
+        audio_sample_rates=None,
+        media_kind=None,
+        previews=None,
+    ):
+        """Validate media synchronously, then submit best-effort I/O with a step snapshot."""
+        previews = validate_previews(previews, len(inputs))
+        if previews == []:
+            return
+        effective_media_kind = previews[0].spec.modality if previews is not None else media_kind
+        if previews is None:
+            _validate_generation_outputs(outputs)
+            resolve_is_video(effective_media_kind)
+            validate_visual_media_batch_rank(outputs.ndim, effective_media_kind)
+        if effective_media_kind == "video":
+            validate_audio_batch(audios, audio_sample_rates, len(inputs), context="generation dump")
+        self._drain_dump_futures()
+        if self._dump_futures:
+            logger.warning("Skipping media dump at step %s: previous dump is still running", self.global_steps)
+            return
+        full_count = len(inputs)
+        retained_count = full_count if max_samples is None else min(max_samples, full_count)
+        if retained_count != full_count:
+            inputs = list(inputs)[:retained_count]
+            gts = list(gts)[:retained_count]
+            scores = list(scores)[:retained_count]
+            reward_extra_infos_dict = {
+                key: list(values)[:retained_count] if len(values) == full_count else values
+                for key, values in reward_extra_infos_dict.items()
+            }
+            audios = batch_items(audios, full_count, "audio")[:retained_count]
+            audio_sample_rates = batch_items(audio_sample_rates, full_count, "audio_sample_rate")[:retained_count]
+            if previews is not None:
+                previews = previews[:retained_count]
+            else:
+                outputs = outputs[:retained_count]
+            max_samples = None
+        global_step = self.global_steps
+        outputs_to_dump = None if previews is not None else _copy_media_to_cpu(outputs)
+        audios_to_dump = _copy_media_to_cpu(audios)
+        audio_sample_rates_to_dump = _copy_media_to_cpu(audio_sample_rates)
+        previews_to_dump = _copy_media_to_cpu(previews)
+        future = self._dump_executor.submit(
+            dump_generations,
+            global_step,
+            inputs,
+            outputs_to_dump,
+            gts,
+            scores,
+            reward_extra_infos_dict,
+            dump_path,
+            max_samples,
+            fps,
+            audios_to_dump,
+            audio_sample_rates_to_dump,
+            media_kind,
+            previews_to_dump,
+        )
+        self._dump_futures.append((future, global_step))
+
+    def _log_rollout_data(self, batch_meta: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
+        """Fetch rollout rows from TQ and dump sorted by uid.
+
+        Reads only the dump's fields; the trainer-only latents/embeds stay in
+        TransferQueue instead of crossing the wire a second time.
+        """
+        with marked_timer("dump_rollout_generations", timing_raw, color="green"):
+            data = diffusion_tq_batch_to_dataproto(
+                batch_meta,
+                pad_token_id=self.tokenizer.pad_token_id or 0,
+                select_fields=diffusion_dump_tq_fields(batch_meta),
+            )
+            inputs = self.tokenizer.batch_decode(data.batch["prompts"], skip_special_tokens=True)
+            outputs = data.batch["responses"]
+            scores = (
+                data.batch["sample_level_scores"].sum(-1).cpu().tolist()
+                if "sample_level_scores" in data.batch
+                else (
+                    data.batch["rm_scores"].sum(-1).cpu().tolist() if "rm_scores" in data.batch else [0.0] * len(data)
+                )
+            )
+            rm_meta = data.non_tensor_batch.get("reward_model")
+            gts = (
+                [item.get("ground_truth", None) for item in rm_meta.tolist()]
+                if rm_meta is not None
+                else [None] * len(data)
+            )
+            tool_extra = data.non_tensor_batch.get("tool_extra_fields")
+            audios = _resolve_rollout_media_field(data, tool_extra, "audio")
+            audio_sample_rates = _resolve_rollout_media_field(data, tool_extra, "audio_sample_rate")
+            media_kinds = _resolve_rollout_media_field(data, tool_extra, "media_kind")
+            previews = previews_from_batch(data)
+
+            sort_idx = sort_diffusion_tq_keys(list(batch_meta.keys))
+            if previews is not None:
+                previews = [previews[i] for i in sort_idx]
+            inputs = [inputs[i] for i in sort_idx]
+            outputs = outputs[torch.tensor(sort_idx)]
+            gts = [gts[i] for i in sort_idx]
+            scores = [scores[i] for i in sort_idx]
+            audios = [audios[i] for i in sort_idx]
+            audio_sample_rates = [audio_sample_rates[i] for i in sort_idx]
+            media_kinds = [media_kinds[i] for i in sort_idx]
+            reward_extra_infos_dict = {"uid": [batch_meta.keys[i] for i in sort_idx]}
+            self._dump_generations(
+                inputs=inputs,
+                outputs=outputs,
+                gts=gts,
+                scores=scores,
+                reward_extra_infos_dict=reward_extra_infos_dict,
+                dump_path=rollout_data_dir,
+                max_samples=self.config.trainer.get("rollout_data_max_samples", None),
+                fps=int(self.config.trainer.get("video_fps", 24)),
+                audios=audios,
+                audio_sample_rates=audio_sample_rates,
+                media_kind=resolve_batch_media_kind(media_kinds),
+                previews=previews,
+            )
+
+    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns) -> dict:
+        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
+        metric_dict = {}
+        for data_source, var2metric2val in data_src2var2metric2val.items():
+            core_var = "acc" if "acc" in var2metric2val else "reward"
+            for var_name, metric2val in var2metric2val.items():
+                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
+                for metric_name, metric_val in metric2val.items():
+                    if (
+                        (var_name == core_var)
+                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
+                        and (f"@{n_max}" in metric_name)
+                    ):
+                        metric_sec = "val-core"
+                    else:
+                        metric_sec = "val-aux"
+                    metric_dict[f"{metric_sec}/{data_source}/{var_name}/{metric_name}"] = metric_val
+        if len(sample_turns) > 0:
+            sample_turns = np.concatenate(sample_turns)
+            metric_dict["val-aux/num_turns/min"] = sample_turns.min()
+            metric_dict["val-aux/num_turns/max"] = sample_turns.max()
+            metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
+        return metric_dict
+
+    def _compute_metrics(self, batch_meta: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
+        data = diffusion_tq_batch_to_dataproto(
+            batch_meta,
+            pad_token_id=self.tokenizer.pad_token_id or 0,
+            select_fields=diffusion_metric_tq_fields(
+                "direct_preference" if self._is_direct_preference else "policy_gradient"
+            ),
+        )
+        metrics.update({"training/global_step": global_steps, "training/epoch": epoch})
+        metrics.update(compute_data_metrics_diffusion(batch=data))
+        n_gpus = self._get_n_gpus_for_throughput()
+        num_images = (
+            data.batch["advantages"].shape[0]
+            if "advantages" in data.batch
+            else data.batch["sample_level_scores"].shape[0]
+        )
+        response_shape_tags = [tag for tag in batch_meta.tags if not tag.get("is_padding", False)]
+        response_shapes = []
+        for tag in response_shape_tags:
+            shape = tag.get("response_shape") if isinstance(tag, dict) else None
+            if (
+                not isinstance(shape, list | tuple)
+                or not shape
+                or any(isinstance(dim, bool) or not isinstance(dim, Integral) or dim <= 0 for dim in shape)
+            ):
+                response_shapes = []
+                break
+            response_shapes.append(tuple(int(dim) for dim in shape))
+        if (
+            response_shapes
+            and len(response_shapes) == len(response_shape_tags)
+            and len({len(s) for s in response_shapes}) == 1
+        ):
+            responses_shape = (
+                len(response_shapes),
+                *(max(dims) for dims in zip(*response_shapes, strict=True)),
+            )
+        else:
+            # Shape is observability metadata, not a training input. Historical
+            # and custom TQ writers may omit it; never re-read large responses.
+            responses_shape = None
+            logger.warning(
+                "Train step=%d: response_shape telemetry is unavailable; continuing without image-shape logging.",
+                global_steps,
+            )
+        metrics["training/tq_response_shape_unavailable"] = float(responses_shape is None)
+        real_images = responses_shape[0] if responses_shape is not None and len(responses_shape) >= 4 else "unknown"
+        logger.info(
+            "Train step=%d: %d trajectories, %s real images, responses shape=%s",
+            global_steps,
+            len(data),
+            real_images,
+            responses_shape,
+        )
+        metrics.update(compute_timing_metrics_diffusion(timing_raw=timing_raw, num_images=num_images))
+        metrics.update(compute_throughput_metrics_diffusion(batch=data, timing_raw=timing_raw, n_gpus=n_gpus))
+        reward_extra_infos_dict = {}
+        if "reward_extra_info" in data.non_tensor_batch:
+            infos = data.non_tensor_batch["reward_extra_info"].tolist()
+            keys = infos[0].keys() if infos and isinstance(infos[0], dict) else []
+            for key in keys:
+                reward_extra_infos_dict[key] = [info.get(key) for info in infos]
+        metrics.update(compute_reward_extra_metrics_diffusion(reward_extra_infos_dict))
+        gradient_norm = metrics.get("actor/grad_norm", None)
+        if "advantages" in data.batch:
+            metrics.update(compute_variance_proxy_metrics(batch=data, gradient_norm=gradient_norm))
+        self._nonfinite_grad_streak = track_nonfinite_grad_streak(self._nonfinite_grad_streak, gradient_norm)
+        metrics["train/nonfinite_grad_steps"] = self._nonfinite_grad_streak
+
+        # off-policy staleness metrics (model-version units)
+        non_padding = np.array([not tag.get("is_padding", False) for tag in batch_meta.tags], dtype=bool)
+        if non_padding.any():
+            min_gs = np.array([tag["min_global_steps"] for tag in batch_meta.tags], dtype=int)[non_padding]
+            max_gs = np.array([tag["max_global_steps"] for tag in batch_meta.tags], dtype=int)[non_padding]
+            spans = max_gs - min_gs + 1
+            staleness = (global_steps - 1) - max_gs
+            staleness_worst = (global_steps - 1) - min_gs
+            metrics.update(
+                {
+                    "training/off_policy/trajectory_spans/mean": spans.mean(),
+                    "training/off_policy/trajectory_spans/max": spans.max(),
+                    "training/off_policy/trajectory_spans/min": spans.min(),
+                    "training/off_policy/trajectory_staleness/mean": staleness.mean(),
+                    "training/off_policy/trajectory_staleness/max": staleness.max(),
+                    "training/off_policy/trajectory_staleness/min": staleness.min(),
+                    "training/off_policy/trajectory_staleness_worst/mean": staleness_worst.mean(),
+                    "training/off_policy/trajectory_staleness_worst/max": staleness_worst.max(),
+                    "training/off_policy/trajectory_staleness_worst/min": staleness_worst.min(),
+                }
+            )
+
+    def _save_checkpoint(self):
+        from verl.utils.fs import local_mkdir_safe
+
+        local_global_step_folder = os.path.join(
+            self.config.trainer.default_local_dir, f"global_step_{self.global_steps}"
+        )
+        logger.info(f"Saving diffusion checkpoint to {local_global_step_folder}")
+        actor_local_path = os.path.join(local_global_step_folder, "actor")
+        actor_remote_path = (
+            None
+            if self.config.trainer.default_hdfs_dir is None
+            else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "actor")
+        )
+        max_actor_ckpt_to_keep = self.config.trainer.get("max_actor_ckpt_to_keep", None)
+        self.actor_rollout_wg.save_checkpoint(
+            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
+        )
+
+        local_mkdir_safe(local_global_step_folder)
+        torch.save(self.train_dataloader.state_dict(), os.path.join(local_global_step_folder, "data.pt"))
+
+        if self.trainer_mode != "sync" and _tq_supports_checkpoint():
+            tq.save_checkpoint(
+                os.path.join(local_global_step_folder, "transfer_queue"),
+                metadata={"global_steps": self.global_steps},
+            )
+
+        latest = os.path.join(self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt")
+        with open(latest, "w") as f:
+            f.write(str(self.global_steps))
+
+    def _load_checkpoint(self):
+        self.global_steps = 0
+        if self.config.trainer.resume_mode == "disable":
+            return
+        if self.config.trainer.resume_mode == "auto":
+            checkpoint_folder = self.config.trainer.default_local_dir
+            if not os.path.isabs(checkpoint_folder):
+                checkpoint_folder = os.path.join(os.getcwd(), checkpoint_folder)
+            global_step_folder = find_latest_ckpt_path(checkpoint_folder)
+            if global_step_folder is None:
+                logger.info("Training from scratch")
+                return
+        elif self.config.trainer.resume_mode == "resume_path":
+            assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
+            global_step_folder = self.config.trainer.resume_from_path
+            if not os.path.isabs(global_step_folder):
+                global_step_folder = os.path.join(os.getcwd(), global_step_folder)
+        else:
+            raise ValueError(
+                f"Unknown trainer.resume_mode={self.config.trainer.resume_mode!r}. "
+                "Available options: ['disable', 'auto', 'resume_path']."
+            )
+
+        self.global_steps = int(global_step_folder.split("global_step_")[-1])
+        logger.info(f"Resuming diffusion from {global_step_folder}, global_steps={self.global_steps}")
+        self.actor_rollout_wg.load_checkpoint(
+            os.path.join(global_step_folder, "actor"),
+            del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
+        )
+        dataloader_path = os.path.join(global_step_folder, "data.pt")
+        if os.path.exists(dataloader_path):
+            self.train_dataloader.load_state_dict(torch.load(dataloader_path, weights_only=False))
+        else:
+            logger.warning(f"No dataloader state at {dataloader_path}, starting from scratch")
+
+        if self.trainer_mode != "sync":
+            tq_checkpoint = os.path.join(global_step_folder, "transfer_queue")
+            if not _tq_supports_checkpoint():
+                logger.warning(
+                    "TransferQueue checkpoint recovery is unavailable; async queue state will start empty. "
+                    "TransferQueue >= 0.1.9 with save_checkpoint/load_checkpoint is required."
+                )
+            elif os.path.exists(tq_checkpoint):
+                logger.info(f"Loading TransferQueue state from {tq_checkpoint}")
+                tq.load_checkpoint(tq_checkpoint)
+            else:
+                logger.warning(f"No TransferQueue state at {tq_checkpoint}; async queue state will start empty")
+
+    def _reissue_inflight_prompts(self, partition_id: str = "train") -> int:
+        """Restart checkpointed pending and running prompt groups."""
+        if self.trainer_mode == "sync" or not _tq_supports_checkpoint():
+            return 0
+
+        data = tq.kv_list(partition_id)
+        if not data:
+            return 0
+        items = data.get(partition_id, {})
+        inflight_uids = [
+            key
+            for key, tag in items.items()
+            if tag.get("is_prompt", False) and tag.get("status") in ("pending", "running")
+        ]
+        if not inflight_uids:
+            return 0
+
+        batch = tq.kv_batch_get(keys=inflight_uids, partition_id=partition_id)
+        inflight_uid_set = set(inflight_uids)
+        partial_trajectory_keys = [
+            key
+            for key, tag in items.items()
+            if not tag.get("is_prompt", False) and self._trajectory_uid(key) in inflight_uid_set
+        ]
+        if partial_trajectory_keys:
+            tq.kv_clear(keys=partial_trajectory_keys, partition_id=partition_id)
+
+        tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
+        tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in inflight_uids]
+        from tensordict.tensorclass import NonTensorData
+
+        tq.kv_batch_put(
+            keys=inflight_uids,
+            partition_id=partition_id,
+            tags=tags,
+            fields=batch.select(*[key for key in batch.keys() if not isinstance(batch.get(key), NonTensorData)]),
+        )
+        self.agent_loop_manager.generate_sequences(batch)
+
+        logger.info(
+            "Re-issued %d in-flight prompts for step %d; cleared %d partial trajectories",
+            len(inflight_uids),
+            self.global_steps,
+            len(partial_trajectory_keys),
+        )
+        return len(inflight_uids)

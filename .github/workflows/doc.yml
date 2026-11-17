@@ -1,0 +1,68 @@
+name: doc
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+    types: [labeled]
+    paths:
+      - "**/*.py"
+      - "docs/**"
+      # Example READMEs are the Sphinx sources via git symlinks under docs/examples/.
+      - "examples/**"
+      - .github/verl_pin.txt
+      - .github/vllm_omni_pin.txt
+      - .github/workflows/doc.yml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  doc:
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(join(github.event.pull_request.labels.*.name, ','), 'ci')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            .github/vllm_omni_pin.txt
+            .github/verl_pin.txt
+      - name: Install dependencies
+        run: |
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu "https://github.com/vllm-project/vllm/releases/download/v0.30.0/vllm-0.30.0+cpu-cp38-abi3-manylinux_2_39_x86_64.whl"
+          pip install uv
+          uv pip install --python "$(command -v python)" -e .
+          pip install -r docs/requirements-docs.txt
+      - name: Build docs
+        run: |
+          cd docs
+          make clean
+          make html SPHINXOPTS="--keep-going -w _build/sphinx.log"
+          if grep -q ": ERROR:" _build/sphinx.log; then
+            echo "Sphinx build contained ERRORs - see _build/sphinx.log"
+            cat _build/sphinx.log
+            exit 1
+          fi
+          if grep -q "WARNING: document isn't included in any toctree" _build/sphinx.log; then
+            echo "Sphinx build WARNING: document not included in any toctree"
+            cat _build/sphinx.log
+            exit 1
+          fi

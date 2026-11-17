@@ -1,0 +1,130 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
+import sys
+
+import pytest
+from omegaconf import OmegaConf
+
+from tests.utils.smoke_attention import resolve_smoke_attention_backends
+from verl_omni.utils.diffusion_attention import validate_attention_consistency
+from verl_omni.workers.config.diffusion import DiffusionModelConfig, DiffusionRolloutConfig
+
+
+def test_rollout_config_builds_structured_vllm_omni_attention_config():
+    config = DiffusionRolloutConfig(name="vllm_omni", rollout_attn_backend="FLASH_ATTN")
+
+    assert config.to_vllm_omni_attention_config() == {"default": {"backend": "FLASH_ATTN"}}
+
+
+def test_veomni_strategy_skips_with_warning(caplog):
+    with caplog.at_level(logging.WARNING, logger="verl_omni.utils.diffusion_attention"):
+        validate_attention_consistency(
+            OmegaConf.create(
+                {
+                    "actor_rollout_ref": {
+                        "model": {"attn_backend": "native"},
+                        "actor": {"strategy": "veomni"},
+                        "rollout": {"rollout_attn_backend": "FLASH_ATTN"},
+                    }
+                }
+            )
+        )
+    assert "veomni" in caplog.text
+
+
+def test_fa3_actor_allows_flash_attn_3_hub():
+    validate_attention_consistency(
+        OmegaConf.create(
+            {
+                "actor_rollout_ref": {
+                    "model": {"attn_backend": "_flash_3_varlen_hub"},
+                    "actor": {"strategy": "fsdp2"},
+                    "rollout": {"rollout_attn_backend": "FLASH_ATTN_3_HUB"},
+                }
+            }
+        )
+    )
+
+
+def test_fa3_actor_allows_flash_attn():
+    validate_attention_consistency(
+        OmegaConf.create(
+            {
+                "actor_rollout_ref": {
+                    "model": {"attn_backend": "_flash_3_varlen_hub"},
+                    "actor": {"strategy": "fsdp2"},
+                    "rollout": {"rollout_attn_backend": "FLASH_ATTN"},
+                }
+            }
+        )
+    )
+
+
+def test_native_actor_rejects_flash_attn_3_hub():
+    try:
+        validate_attention_consistency(
+            OmegaConf.create(
+                {
+                    "actor_rollout_ref": {
+                        "model": {"attn_backend": "native"},
+                        "actor": {"strategy": "fsdp2"},
+                        "rollout": {"rollout_attn_backend": "FLASH_ATTN_3_HUB"},
+                    }
+                }
+            )
+        )
+    except ValueError as exc:
+        assert "rollout_attn_backend='TORCH_SDPA'" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+@pytest.mark.parametrize("attn_backend", ["flash_varlen_hub", "_flash_3_varlen_hub"])
+def test_fa_actor_backend_without_kernels_raises(monkeypatch, tmp_path, attn_backend):
+    monkeypatch.setitem(sys.modules, "kernels", None)
+    with pytest.raises(ImportError, match="requires `kernels` package"):
+        DiffusionModelConfig(
+            path=str(tmp_path),
+            architecture="StableDiffusion3Pipeline",
+            algorithm="flow_grpo",
+            attn_backend=attn_backend,
+            load_tokenizer=False,
+            transformer_config={},
+        )
+
+
+def test_fa2_actor_allows_flash_attn():
+    validate_attention_consistency(
+        OmegaConf.create(
+            {
+                "actor_rollout_ref": {
+                    "model": {"attn_backend": "flash_varlen_hub"},
+                    "actor": {"strategy": "fsdp2"},
+                    "rollout": {"rollout_attn_backend": "FLASH_ATTN"},
+                }
+            }
+        )
+    )
+
+
+def test_resolve_smoke_attention_backends_prefers_local_fa(monkeypatch):
+    monkeypatch.setattr("tests.utils.smoke_attention.fa_available", lambda: True)
+    assert resolve_smoke_attention_backends() == ("_flash_3_varlen_hub", "FLASH_ATTN")
+
+
+def test_resolve_smoke_attention_backends_falls_back_without_fa3(monkeypatch):
+    monkeypatch.setattr("tests.utils.smoke_attention.fa_available", lambda: False)
+    assert resolve_smoke_attention_backends() == ("native", "TORCH_SDPA")

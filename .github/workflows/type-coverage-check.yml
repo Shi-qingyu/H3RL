@@ -1,0 +1,52 @@
+name: type_coverage_check
+
+on:
+  pull_request:
+    branches:
+      - main
+      - v0.*
+    types: [labeled]
+    paths:
+      - "**/*.py"
+      - .github/verl_pin.txt
+      - .github/vllm_omni_pin.txt
+      - .github/workflows/type-coverage-check.yml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  type_coverage_check:
+    if: contains(join(github.event.pull_request.labels.*.name, ','), 'ci')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            .github/vllm_omni_pin.txt
+            .github/verl_pin.txt
+      - name: Install dependencies
+        run: |
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu "https://github.com/vllm-project/vllm/releases/download/v0.30.0/vllm-0.30.0+cpu-cp38-abi3-manylinux_2_39_x86_64.whl"
+          pip install uv
+          uv pip install --python "$(command -v python)" -e .
+          pip install --no-deps --ignore-requires-python veomni==0.1.12
+      - name: Run type annotation coverage check
+        run: python3 tests/special_sanity/type_coverage_check.py
+      - name: Run docstring coverage check
+        run: python3 tests/special_sanity/check_api_docs.py verl_omni

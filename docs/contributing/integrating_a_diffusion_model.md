@@ -1,0 +1,709 @@
+# How to Integrate a New Diffusion Model for FlowGRPO Training
+
+Last updated: 10/05/2026.
+
+This guide walks you through everything required to integrate a new diffusion
+model into VeRL-Omni so it can be trained end-to-end with the **FlowGRPO**
+algorithm. The contracts described below (registry hooks, adapter
+classmethods, scheduler choice, rollout output field names) are specific to
+the FlowGRPO trainer; other RL algorithms may impose different requirements.
+Use
+[`integrating_a_new_policy_gradient_algorithm_for_diffusion_model.md`](integrating_a_new_policy_gradient_algorithm_for_diffusion_model.md)
+for PPO-like policy-gradient algorithms, and
+[`integrating_a_new_direct_preference_algorithm_for_diffusion_model.md`](integrating_a_new_direct_preference_algorithm_for_diffusion_model.md)
+for direct-preference algorithms.
+
+**If diffusers cannot load your model**, use
+[`integrating_a_non_diffusers_model.md`](integrating_a_non_diffusers_model.md)
+instead. That guide covers the `NonDiffusersModelBase` path using BAGEL-7B-MoT as the
+worked example.
+
+We use the **Qwen-Image** integration
+([`verl_omni/pipelines/qwen_image_flow_grpo/`](../../verl_omni/pipelines/qwen_image_flow_grpo/__init__.py))
+as the worked example throughout. Read the source alongside this guide — the
+code is the canonical reference.
+
+---
+
+## TL;DR
+
+A new model needs **three files in one new package** plus **two registry
+hooks**. The same adapters work with both the default diffusers + FSDP2
+backend and the optional [VeOmni backend](#53-use-the-veomni-backend-optional) — backend selection is purely a configuration concern.
+
+```
+verl_omni/pipelines/<model>_flow_grpo/
+├── __init__.py                       # re-exports both adapters
+├── diffusers_training_adapter.py     # subclass of DiffusionModelBase
+└── vllm_omni_rollout_adapter.py      # subclass of VllmOmniPipelineBase
+```
+
+Both adapters are picked up by string-based registries that dispatch on
+the pair `(model_index.json::_class_name, algorithm)`. By default the
+algorithm is read from `actor_rollout_ref.model.algorithm`, which is the
+source-of-truth in the current trainer wiring. Register the package by importing it
+from
+[`verl_omni/pipelines/__init__.py`](../../verl_omni/pipelines/__init__.py),
+add an example launch script, and add a smoke test.
+
+---
+
+## Mental Model
+
+There are two execution contexts you must serve, and they share the **same
+algorithm** (FlowGRPO) but use **different runtimes**:
+
+| Context | Runtime | What you implement |
+|---|---|---|
+| **Rollout** (sampling trajectories) | vllm-omni | `VllmOmniPipelineBase` subclass — runs the SDE loop and returns latents, log-probs, and prompt embeddings. |
+| **Training** (per-step forward + loss) | FSDP + diffusers | `DiffusionModelBase` subclass — re-runs one denoising step per micro-batch slot to compute fresh log-probs for the policy gradient. |
+
+The trainer runtime can also be VeOmni's FSDP2-based DiT trainer; see [§ 5.3](#53-use-the-veomni-backend-optional). The training-adapter contract (`prepare_model_inputs` / `forward_and_sample_previous_step`) is identical on both backends.
+
+```text
+  ┌─────────────────────────┐                ┌──────────────────────────┐
+  │ Rollout worker          │   trajectory   │ Trainer worker           │
+  │ (vllm-omni)             │ ─────────────▶ │ (FSDP + diffusers)       │
+  │                         │  latents,      │                          │
+  │ VllmOmniPipelineBase    │  log_probs,    │ DiffusionModelBase       │
+  │  └─ diffuse() + SDE     │  prompt embeds │  └─ prepare_model_inputs │
+  │                         │                │  └─ forward_and_sample…  │
+  └─────────────────────────┘                └──────────────────────────┘
+```
+
+The two adapters must agree on:
+
+- **Architecture string** (the first `@register(...)` argument). It must
+  match `model_index.json::_class_name` exactly. For Qwen-Image this is
+  `"QwenImagePipeline"`.
+- **Algorithm string** (the `algorithm=` keyword on `@register(...)`).
+  For this guide the value is always `"flow_grpo"`. When integrating a
+  different RL algorithm use the appropriate algorithm name and the matching
+  algorithm-family guide.
+- **Prompt-encoding format** of the embeddings shipped through the agent
+  loop. The rollout always returns padded `(B, L, D)` + `(B, L)` mask;
+  the training adapter is free to convert to whatever the transformer
+  needs.
+- **Scheduler choice** so log-probs computed on each side are comparable.
+- **Prompt tokenisation contract** — who tokenises, who encodes, and which
+  tensor keys cross the agent loop boundary (see
+  [Prompt Tokenisation](#prompt-tokenisation-agent-loop--rollout) below).
+
+---
+
+## Prompt Tokenisation (Agent Loop → Rollout)
+
+verl-omni follows the verl design: **tokenisation happens once, in the agent
+loop**. The rollout pipeline must not decode token ids back to text and
+re-tokenise. Training never re-encodes prompts — it consumes the
+`prompt_embeds` (and model-specific extras such as SD3's
+`pooled_prompt_embeds`) that rollout cached in the batch.
+
+Rollout is configured with `skip_tokenizer_init=True`; the vLLM-Omni engine
+expects pre-tokenised input on every request.
+
+### Single text encoder (Qwen-Image and similar)
+
+One tokenizer, one text encoder. The agent loop sends `prompt_ids` to the server;
+the diffusion prompt keeps that canonical spelling. Your rollout adapter overrides
+`encode_prompt` to accept `prompt_ids=` (and an
+optional attention mask) and runs the text encoder directly — see
+[`qwen_image_flow_grpo/common.py`](../../verl_omni/pipelines/qwen_image_flow_grpo/common.py).
+
+No `extra_tokenizers` config is needed.
+
+### Multiple text encoders (SD3.5 and similar)
+
+Some pipelines combine several text encoders with **more than one tokenizer
+vocabulary** (SD3.5: CLIP-L + CLIP-G share one vocab; T5 uses a separate
+vocab). Configure one entry per **distinct tokenizer**, not per encoder:
+
+```yaml
+# actor_rollout_ref.model.extra_tokenizers
+clip: {path: tokenizer, max_length: 77}      # feeds CLIP-L and CLIP-G
+t5:   {path: tokenizer_3, max_length: 256}   # feeds T5; align max_length with pipeline.max_sequence_length
+```
+
+**Agent loop behaviour**
+
+1. Render the chat template to plain text once (`custom_chat_template` +
+   `data.apply_chat_template_kwargs` must match your data preprocessor).
+2. Tokenise that text with each entry in `extra_tokenizers` (HF
+   `truncation=True`, `max_length` per entry). Result:
+   `extra_prompt_ids = {name: token_ids, ...}` (unpadded, with special
+   tokens).
+3. Also tokenise with the **primary** tokenizer (see below) into
+   `prompt_token_ids` for batch bookkeeping.
+
+**Rollout transport**
+
+[`vLLMOmniHttpServer`](../../verl_omni/workers/rollout/vllm_rollout/vllm_omni_async_server.py)
+places `extra_prompt_ids` / `negative_extra_prompt_ids` inside the diffusion
+prompt's `extra_args`, alongside the top-level canonical `prompt_ids`. Media and
+`mm_processor_kwargs` stay at the top level: the pinned MiniMax/Bagel runtime reads
+them there, even though upstream's `OmniCustomPrompt` TypedDict omits those fields.
+The server never duplicates media into `extra_args`.
+
+Multistage rollout whose first stage is AR still needs vLLM's `prompt_token_ids`
+at that entrance. `prompt_ids_from_payload` is the sole shared adapter bridge for
+that spelling and rejects conflicting IDs. The public Ray keyword API and AR
+strategy are unchanged. Historical condition-image aliases are accepted only by
+the conflict-checking compatibility parser, not emitted on the new wire path.
+
+**Rollout adapter behaviour**
+
+Read `req.prompts[0]["extra_args"]["extra_prompt_ids"]`, pad each id list to the encoder's
+fixed length using **that tokenizer's** `pad_token_id` (SD3 CLIP-L and CLIP-G
+use different pad tokens even though they share a vocab), run the text
+encoders on `input_ids`, and concatenate embeddings exactly as the upstream
+`encode_prompt(text=...)` path would. Do **not** decode ids to strings.
+
+SD3.5 reference:
+[`sd3_flow_grpo/common.py`](../../verl_omni/pipelines/sd3_flow_grpo/common.py)
+(`SD3TokenIdPromptMixin`) and
+[`sd3_flow_grpo/vllm_omni_rollout_adapter.py`](../../verl_omni/pipelines/sd3_flow_grpo/vllm_omni_rollout_adapter.py).
+Recipe:
+[`examples/flowgrpo_trainer/sd35/run_sd35_medium_ocr_lora.sh`](../../examples/flowgrpo_trainer/sd35/run_sd35_medium_ocr_lora.sh).
+Parity test:
+[`tests/pipelines/test_sd3_token_id_prompt_on_cpu.py`](../../tests/pipelines/test_sd3_token_id_prompt_on_cpu.py).
+
+**Why `primary` vs `extra` tokenizers?**
+
+This is not a semantic split between "main" and "secondary" encoders.
+
+- **`extra_tokenizers`** — the general mechanism for multi-vocab models. Add
+  as many named entries as you have distinct tokenizers (`clip`, `t5`, …).
+  Your rollout adapter defines which keys it reads (SD3 expects `clip` and
+  `t5`).
+- **Primary tokenizer** (`tokenizer_path`, default `<model>/tokenizer`) —
+  legacy verl batch field `prompts` (`[bsz, prompt_length]`), logging, and
+  single-encoder models (Qwen-Image). For SD3.5 RL training the rollout path
+  uses `extra_prompt_ids`; the primary ids are kept for compatibility only.
+
+For a future model with three or more tokenizers, list all of them under
+`extra_tokenizers` — there is no hard cap of two. Shared-vocab encoders reuse
+one entry (SD3 CLIP-L/G both consume the `clip` ids).
+
+**Truncation vs padding**
+
+- Truncate in the agent loop (preserves EOS semantics per tokenizer).
+- Pad to fixed encoder length in the rollout adapter (matches diffusers
+  `padding="max_length"` behaviour and per-encoder pad tokens).
+
+**Anti-patterns**
+
+- Decoding `prompt_token_ids` inside the rollout adapter and calling
+  `encode_prompt(text=...)` — acceptable only as a temporary bridge; not for
+  merged integrations.
+- Tokenising only one vocab and hoping another encoder can reuse those ids
+  (T5 cannot consume CLIP token ids).
+- Re-encoding prompts on the training side.
+
+---
+
+## Prerequisites
+
+Before you start, the new model must already be supported upstream by:
+
+- **diffusers** — provides the transformer (`<Name>Transformer2DModel`),
+  scheduler config, and a reference inference pipeline.
+- **vllm-omni** — provides the rollout-side `<Name>Pipeline`. Your
+  rollout adapter inherits from this class.
+
+If either is missing, upstream the model first. Nothing below will work
+without them.
+
+---
+
+## Step 1 — Read the Upstream Pipelines and Note the Differences
+
+Open the upstream diffusers pipeline (`__call__`) and the vllm-omni
+rollout pipeline (`forward`). Answer these questions before writing any
+code — the answers determine every helper you need:
+
+1. **Latent shape.** Packed sequence `(B, seq, 4·C)` (Qwen-Image) or 4-D
+   `(B, C, H, W)`?
+2. **Text encoder output.** Fixed `(B, L, D)` plus a mask, or a list of
+   variable-length per-sample tensors?
+3. **Transformer signature.** What kwargs does it accept? Any extras
+   (`img_shapes`, `txt_seq_lens`, `guidance`, …)?
+4. **Timestep convention.** `t/1000`? `(1000 - t)/1000`? Something else?
+5. **Output sign.** Is the predicted velocity / noise negated before
+   being passed to the scheduler?
+6. **CFG flavour.** "True CFG" with renormalisation? Standard CFG with
+   optional norm clipping? At what threshold is CFG active?
+7. **VAE post-processing.** `latents / scaling_factor + shift_factor`,
+   `latents / std + mean`, or other?
+8. **Prompt template.** Does the upstream `_encode_prompt` prepend a
+   hard-coded system prompt? Whatever it does, your **data preprocessor
+   must match exactly** so training-time and inference-time tokenisation
+   agree.
+
+Anything model-specific belongs inside the model's own package;
+anything reusable belongs in
+[`pipelines/utils.py`](../../verl_omni/pipelines/utils.py)
+(training dispatch),
+[`pipelines/request_batch.py`](../../verl_omni/pipelines/request_batch.py)
+(request-level batching collate/split), or
+[`pipelines/model_base.py`](../../verl_omni/pipelines/model_base.py).
+
+---
+
+## Step 2 — Scaffold the Package
+
+Create the new package and start by copying
+[`verl_omni/pipelines/qwen_image_flow_grpo/`](../../verl_omni/pipelines/qwen_image_flow_grpo/__init__.py)
+as a template:
+
+```
+verl_omni/pipelines/<model>_flow_grpo/
+├── __init__.py
+├── diffusers_training_adapter.py
+└── vllm_omni_rollout_adapter.py
+```
+
+The `__init__.py` re-exports both adapters so the `@register(...)`
+decorators run on import — follow the existing Qwen-Image pattern:
+
+```python
+from .diffusers_training_adapter import MyModel
+from .vllm_omni_rollout_adapter import MyModelPipelineWithLogProb
+
+__all__ = ["MyModel", "MyModelPipelineWithLogProb"]
+```
+
+Finally, **register the package** by adding a star-import to
+[`verl_omni/pipelines/__init__.py`](../../verl_omni/pipelines/__init__.py)
+so both registries learn about your model when `verl_omni.pipelines` is
+imported:
+
+```python
+from .qwen_image_flow_grpo import *  # noqa: F401, F403
+from .my_model_flow_grpo import *    # noqa: F401, F403
+
+__all__ = list(qwen_image_flow_grpo.__all__)
+__all__ += my_model_flow_grpo.__all__
+```
+
+> **Note.** `vllm_omni` is a hard dependency of `verl-omni`, so the
+> rollout adapter import does not need to be guarded.
+
+---
+
+## Step 3 — Write `diffusers_training_adapter.py`
+
+Subclass [`DiffusionModelBase`](../../verl_omni/pipelines/model_base.py),
+decorate it with the architecture string, and implement the four
+classmethods:
+
+```python
+@DiffusionModelBase.register("MyModelPipeline", algorithm="flow_grpo")
+class MyModel(DiffusionModelBase):
+    @classmethod
+    def build_scheduler(cls, model_config): ...
+
+    @classmethod
+    def set_timesteps(cls, scheduler, model_config, device): ...
+
+    @classmethod
+    def prepare_model_inputs(cls, module, model_config, latents, timesteps,
+                             prompt_embeds, prompt_embeds_mask,
+                             negative_prompt_embeds, negative_prompt_embeds_mask,
+                             micro_batch, step): ...
+
+    @classmethod
+    def forward_and_sample_previous_step(cls, module, scheduler, model_config,
+                                         model_inputs, negative_model_inputs,
+                                         scheduler_inputs, step): ...
+```
+
+### 3.1 (Optional) `configure_trainable_params`
+
+Override this hook to selectively set ``requires_grad`` for non-LoRA
+full-weight training.  The engine calls it after module build, before
+FSDP wrapping, when ``lora_rank=0``.  When LoRA is enabled this hook
+is **not** called — ``requires_grad`` is managed by the LoRA adapter
+instead.  The default is a no-op (all params trainable).
+
+### 3.2 `build_scheduler` and `set_timesteps`
+
+Reuse
+[`FlowMatchSDEDiscreteScheduler`](../../verl_omni/pipelines/schedulers/flow_match_sde.py)
+unless you have a strong reason not to — FlowGRPO only requires a
+flow-matching scheduler that exposes `sample_previous_step(...)`.
+
+Compute `image_seq_len` and `mu` exactly as the upstream diffusers
+pipeline does. If they drift, the training-time noise schedule will not
+match deployment.
+
+### 3.3 `prepare_model_inputs`
+
+This method receives the **full** batched tensors for the entire
+denoising trajectory (`latents` of shape `(B, T, ...)`, `timesteps` of
+shape `(B, T)`) together with the `step` index. Your implementation is
+responsible for slicing to the current step, e.g.
+`latents[:, step]` and `timesteps[:, step]`, before building model
+inputs. The typical steps are:
+
+1. Slice `latents[:, step]` and `timesteps[:, step]` for the current
+   denoising step.
+2. Apply per-model timestep rescaling.
+3. Convert padded prompt embeddings + mask to whatever format your
+   transformer expects.
+4. Build the **positive** input dict and, if CFG is enabled, the
+   **negative** input dict (same latent + timestep, negative text
+   features).
+
+The usual rollout contract stores a contiguous trajectory in
+`all_latents`, so the next state for slot `step` is
+`all_latents[:, step + 1]`. If a model samples non-contiguous SDE
+transitions, return an aligned `all_next_latents` tensor instead and consume
+`all_next_latents[:, step]` here. This prevents two unrelated sparse
+transitions from being treated as adjacent states.
+
+The dict keys must match the kwargs of the diffusers transformer
+class verbatim — the FSDP engine calls `module(**model_inputs)`.
+
+### 3.4 `forward_and_sample_previous_step`
+
+Call the transformer once for the positive prompt; if CFG is active,
+call it again for the negative prompt and combine them. Always finish with
+`scheduler.sample_previous_step(..., return_sqrt_dt=True)` and return the
+4-tuple `(log_prob, prev_sample_mean, std_dev_t, sqrt_dt)` — that is what
+[`PPODiffusersFSDPEngine.prepare_model_outputs`](../../verl_omni/workers/engine/fsdp/diffusers_impl.py)
+consumes.
+
+> **Tip.** If your transformer returns a list (one element per sample),
+> wrap the call in a small helper that re-stacks to `(B, C, H, W)` so
+> the rest of the pipeline keeps a single tensor convention.
+
+### 3.5 (Optional) `validate_lora_config`
+
+Override this hook when the actor→rollout LoRA weight sync can only
+transport a subset of target modules — e.g. a fused-DiT layout where
+FSDP layered-summon does not carry top-level LoRAs.  ``DiffusionModelConfig``
+calls it at config-build time (dispatched via ``DiffusionModelBase.peek_class``)
+so a bad ``target_modules`` fails fast at startup instead of at the first
+weight sync.  The default is a no-op.  MiniMax H3 overrides it to reject
+``all-linear`` and keep LoRA on the transformer/refiner blocks its sync path
+can map.
+
+### 3.6 (Optional) `get_fsdp_ignored_module_names`
+
+Override this hook to declare frozen submodule name components to leave
+unsharded under FSDP2; the default is `[]`. Declare a tower whose forward is
+skipped for some micro-batches — an unsharded forward emits no collectives,
+so the skip cannot desync the ranks. Ignored parameters must stay frozen
+(FSDP2 does not synchronize their gradients), and a non-empty list requires
+`strategy=fsdp2`; the engine raises otherwise.
+
+---
+
+## Step 4 — Write `vllm_omni_rollout_adapter.py`
+
+Subclass the upstream `<Name>Pipeline` from `vllm_omni.diffusion.models`
+and decorate with the same architecture/algorithm pair:
+
+```python
+@VllmOmniPipelineBase.register("MyModelPipeline", algorithm="flow_grpo")
+class MyModelPipelineWithLogProb(MyModelPipeline):
+    ...
+```
+
+Your subclass must do five things:
+
+1. **Replace the upstream scheduler** (typically Euler-based) with
+   `FlowMatchSDEDiscreteScheduler`.
+2. **Implement a token-id-native prompt encoder** (see
+   [Prompt Tokenisation](#prompt-tokenisation-agent-loop--rollout)):
+   - *Single encoder:* override `encode_prompt` to accept `prompt_ids=` and
+     an attention mask; never require raw strings on the RL path.
+   - *Multiple encoders:* read `extra_prompt_ids` from the request, pad per
+     tokenizer, run each text encoder on `input_ids`, and fuse embeddings
+     like upstream `encode_prompt(text=...)`. Never decode ids to text.
+   Always return padded `(B, L, D)` tensors (plus model-specific extras
+   such as SD3 `pooled_prompt_embeds`) and masks where applicable.
+3. **Implement `diffuse(...)`** — the SDE loop that optionally applies
+   CFG and collects `all_latents`, `all_log_probs`, and
+   `all_timesteps`.
+4. **Override `forward(req, ...)`** so that:
+   - Sampling parameters come from `req.sampling_params` (use
+     `extra_args` for SDE-specific knobs).
+   - Build trajectory and algorithm metadata with `rollout_output(...)` or
+     `with_rollout_data(...)` from
+     [`diffusion_rollout_output`](../../verl_omni/pipelines/diffusion_rollout_output.py).
+   - `prompt_embeds`, `prompt_embeds_mask`, `negative_prompt_embeds`,
+     and `negative_prompt_embeds_mask` are placed in `prompt_embeddings`. The diffusion agent loop
+     ([`diffusion_agent_loop.py`](../../verl_omni/agent_loop/diffusion_agent_loop.py))
+     reads these field names verbatim — **do not rename them**.
+5. **Attach named media artifacts** with `with_visual_artifacts`,
+   `with_batched_media_artifacts` or `with_media_artifacts` from
+   [`diffusion_rollout_output`](../../verl_omni/pipelines/diffusion_rollout_output.py),
+   alongside `rollout_output` / `with_rollout_data`. Cover both `forward` and
+   `post_decode` when step execution is supported. Preserve the named envelope
+   through the engine postprocessor; do not return a bare legacy tensor or tuple
+   from the rollout boundary.
+
+### 4.1 Rollout response contract
+
+The adapter declares representation, layout and media kind, then normalizes
+**decoded** outputs once. `responses` is a compatibility projection of the
+explicitly selected primary artifact, not an unlabelled media tensor:
+
+- Decoded image/video is `torch.uint8` `[0,255]` in `CHW` / `TCHW` per sample.
+- Native/packed latents retain their layout and floating dtype. They coexist
+  with decoded previews rather than standing in for missing preview data.
+- Decoded audio is floating `CT`, with an explicit sample rate; it is never
+  quantized as pixels. Video artifacts carry their own FPS.
+
+Both reward managers reconstruct named artifacts and validate the primary
+projection. Pixel scorers select the decoded preview; latent scoring selects
+`image_latent`. A scorer needing normalized pixels converts locally with
+`.float() / 255.0`, not a second multiplication by 255. See the full
+[named-artifact contract](../advanced/diffusion_media_artifacts.md) for selectors, requested
+outputs, batching, transport and fail-fast validation.
+
+(diffusion-io-spec)=
+### 4.2 Declare the media output contract (`diffusion_io_spec`)
+
+Set `diffusion_io_spec` to the named outputs your adapter can produce. The
+strategy resolves it by `(architecture, algorithm)` and checks returned names,
+modality, representation and layout against it. `DiffusionIOSpec` and `MediaSpec`
+retain their names and import location. The positional `primary` / `auxiliary`
+declaration is replaced by named artifacts, with `representation` and `layout`
+added to `MediaSpec`:
+
+```python
+from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
+
+@VllmOmniPipelineBase.register("MyModelPipeline", algorithm="flow_grpo")
+class MyModelPipelineWithLogProb(MyModelPipeline):
+    diffusion_io_spec = DiffusionIOSpec(artifacts={
+        "image_preview": MediaSpec("image", "decoded", "CHW"),
+        "image_latent": MediaSpec("image", "latent", "LC"),
+    })
+```
+
+- Declare **canonical decoded axes** and the model's **native final latent
+  axes**, not guessed channel-size conventions. Verify actual VAE outputs
+  separately from the sampler's packed training representation.
+- Runtime selectors identify primary, optional decoded preview and optional
+  decoded audio by name. `preview=None` skips export; a missing non-null selector
+  fails rather than falling back to latents.
+- Runtime video FPS and audio sample rate are required. A fixed sample rate can
+  be constrained in the declaration; otherwise read the real decoder/vocoder
+  configuration. LTX BWE can produce 48000 Hz audio, not 24000 Hz.
+- `pipeline.requested_outputs` requires extra named artifacts, e.g.
+  `[image_preview]` with `output_type=latent`. It is also available in the model
+  and validation configs. See [named artifacts](../advanced/diffusion_media_artifacts.md)
+  for decoding behavior and batch-union semantics.
+- Subclasses inherit the declaration when they use the same output contract.
+
+Every registered diffusion adapter declares named artifacts; see
+[`rollout_media.py`](../../verl_omni/pipelines/rollout_media.py) and the
+`test_diffusion_io_spec_on_cpu.py` completeness test.
+
+(request-level-batching)=
+### 4.3 Request-level batching (optional)
+
+To let vLLM-Omni pack multiple requests into one transformer forward
+(`max_num_seqs > 1`), extend the rollout adapter as follows. Reference
+implementations:
+[`qwen_image_flow_grpo/vllm_omni_rollout_adapter.py`](../../verl_omni/pipelines/qwen_image_flow_grpo/vllm_omni_rollout_adapter.py)
+and
+[`sd3_flow_grpo/vllm_omni_rollout_adapter.py`](../../verl_omni/pipelines/sd3_flow_grpo/vllm_omni_rollout_adapter.py).
+
+1. Set `supports_request_batch = True` on the pipeline class
+   (otherwise the engine stays serial even if `max_num_seqs > 1`).
+2. Accept `OmniDiffusionRequest | DiffusionRequestBatch` in `forward`.
+3. Normalize with
+   `request_batch = req if isinstance(req, DiffusionRequestBatch) else DiffusionRequestBatch(requests=[req])`.
+4. Collate per-request tensors/prompts (use helpers in
+   [`verl_omni/pipelines/request_batch.py`](../../verl_omni/pipelines/request_batch.py)
+   such as `collate_prompt_rows` / `collate_prompt_mask`, and
+   `request_batch.collate_request_tensors` /
+   `collate_request_generators`).
+5. Run the existing SDE loop once on the packed batch, then split the
+   output with `split_diffusion_output_by_request` when the input was a
+   `DiffusionRequestBatch`.
+
+For launch knobs and measured speedups, see
+[`rollout_batching.md`](../start/rollout_batching.md).
+
+This is separate from step-wise continuous batching
+(`step_execution=true`). For that path, see
+[`integrating_a_stepwise_continuous_batching_model.md`](integrating_a_stepwise_continuous_batching_model.md).
+
+---
+
+## Step 5 — Configure the Pipeline
+
+No code changes are required in the trainer launcher itself. At runtime:
+
+- `DiffusionModelConfig.architecture` is auto-detected from
+  `model_index.json`.
+- `DiffusionModelConfig.algorithm` is set by
+  `actor_rollout_ref.model.algorithm` (default `flow_grpo` in
+  `diffusion_model.yaml`). `algorithm.adv_estimator` is templated to read
+  from this same value.
+- `DiffusionModelBase.get_class(model_config)` resolves to the training
+  adapter registered under `(architecture, algorithm)`.
+- `VllmOmniPipelineBase.get_class(architecture, algorithm)` resolves to
+  the rollout adapter and is consumed by the vllm-omni rollout worker.
+
+### 5.1 Pipeline Config Knobs
+
+Pipeline sampling parameters live under `actor_rollout_ref.rollout.pipeline.*`
+(mapped to
+[`DiffusionPipelineConfig`](../../verl_omni/workers/config/diffusion/rollout.py))
+and are mirrored in `actor_rollout_ref.model.pipeline.*`.
+
+**Always copy the defaults from the upstream HuggingFace model card** so
+RL exploration starts from a known-good operating point.
+
+| Knob | Notes |
+|---|---|
+| `pipeline.height`, `pipeline.width` | Must be a multiple of `vae_scale_factor * 2`. |
+| `pipeline.num_inference_steps` | Steps used **during training rollout**. Default `10` — do not override unless you know why. |
+| `actor_rollout_ref.rollout.val_kwargs.pipeline.num_inference_steps` | Full-quality steps for **validation only** (e.g. `50`). |
+| `pipeline.true_cfg_scale` | For Qwen-Image-style true CFG (e.g. `4.0`). Default `1.0` (disabled). |
+| `pipeline.guidance_scale` | For pipelines whose upstream uses `guidance_scale`. Default `null` defers to the pipeline. |
+| `pipeline.max_sequence_length` | Must accommodate the templated prompt length your tokenizer produces. |
+| `model.extra_tokenizers` | For multi-encoder models only. One entry per distinct tokenizer vocab; keys must match what your rollout adapter expects. |
+
+> **Config hygiene.** Any new field on
+> [`DiffusionPipelineConfig`](../../verl_omni/workers/config/diffusion/rollout.py)
+> must also be added to:
+>
+> - [`diffusion_rollout.yaml`](../../verl_omni/trainer/config/diffusion/rollout/diffusion_rollout.yaml)
+>   — both the top-level `pipeline:` section and `val_kwargs.pipeline:`.
+> - [`diffusion_model.yaml`](../../verl_omni/trainer/config/diffusion/model/diffusion_model.yaml)
+>   — its `pipeline:` section, using
+>   `${oc.select:actor_rollout_ref.rollout.pipeline.<field>,<default>}`.
+
+### 5.2 Example Launch Script and Data Preprocessor
+
+Ship a runnable example so users can launch training without trial and
+error. Use
+[`examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_lora.sh`](../../examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_lora.sh)
+and
+[`examples/flowgrpo_trainer/data_process/qwenimage_ocr.py`](../../examples/flowgrpo_trainer/data_process/qwenimage_ocr.py)
+as templates.
+
+The data preprocessor's tokenisation **must match the upstream
+`_encode_prompt` exactly** — same chat template, same special tokens,
+same `enable_thinking` flag, etc. Mismatches here cause silent reward
+collapse.
+
+(53-use-the-veomni-backend-optional)=
+### 5.3 Use the VeOmni Backend
+
+Backend selection is **orthogonal** to model integration: the adapters you wrote in Steps 3–4 work unchanged regardless of whether the actor runs on the default diffusers + FSDP2 engine or on [VeOmni](https://github.com/ByteDance-Seed/VeOmni). Switching is a configuration concern handled by a few Hydra overrides at launch time.
+
+#### What VeOmni reuses from your model adapter
+
+- `DiffusionModelBase` subclass (Step 3) — used verbatim. The VeOmni engine calls the same `prepare_model_inputs` / `forward_and_sample_previous_step` contract.
+- `VllmOmniPipelineBase` subclass (Step 4) — used verbatim. Rollout always runs in vllm-omni, independent of the actor backend.
+- `FlowMatchSDEDiscreteScheduler` (Step 3.1) — used verbatim.
+
+#### What VeOmni requires that diffusers does not
+
+1. **Upstream support in VeOmni.** Just as diffusers must provide your `<Name>Transformer2DModel`, VeOmni must be able to load your model via its `DiTTrainer` path. If VeOmni does not yet support the architecture, upstream it there first (the diffusers prerequisite from Step 1 still applies for rollout — both upstreams are required).
+2. **`config_path` / `transformer_subfolder`.** The VeOmni engine loads the transformer from `<local_path>/<transformer_subfolder>` and the config from `config_path` (falling back to the weights path). These fields are already on `DiffusionModelConfig` and are shared with the diffusers backend, so no new model-specific fields are needed.
+
+#### Launching with the VeOmni backend
+
+`diffusion/model_engine=veomni_diffusion` switches the entire actor / reference Hydra schema; the other actor-engine fields then live under `actor_rollout_ref.actor.veomni_config.*` and `actor_rollout_ref.ref.veomni_config.*`:
+
+```bash
+python3 -m verl_omni.trainer.main_diffusion \
+    diffusion/model_engine=veomni_diffusion \
+    actor_rollout_ref.actor.strategy=veomni \
+    actor_rollout_ref.actor.veomni_config.strategy=veomni \
+    actor_rollout_ref.ref.veomni_config.strategy=veomni \
+    ...  # everything else identical to your diffusers/FSDP2 recipe
+```
+
+See [`examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_veomni.sh`](../../examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_veomni.sh) for a complete VeOmni recipe that mirrors [`run_qwen_image_ocr.sh`](../../examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr.sh) line-for-line — the diff is only the engine-selection fields. Install instructions for VeOmni alongside vLLM 0.30.0 are in [`docs/start/engine_backends.md`](../start/engine_backends.md).
+
+
+#### Mixing override schemas — don't
+
+`diffusion/model_engine=veomni_diffusion` selects the Hydra schema as a whole. Do **not** mix `actor.fsdp_config.*` and `actor.veomni_config.*` overrides in the same run — the fields for the other engine will be rejected as unknown keys at config-resolution time.
+
+---
+
+## Step 6 — Add a Smoke Test
+
+Add an end-to-end smoke test under `tests/special_e2e/` modelled on
+[`tests/special_e2e/run_flowgrpo_qwen_image.sh`](../../tests/special_e2e/run_flowgrpo_qwen_image.sh).
+The script must exercise the full pipeline against a `tiny-random/<ModelName>`
+checkpoint:
+
+1. Generate dummy parquet data via
+   [`tests/special_e2e/create_dummy_diffusion_data.py`](../../tests/special_e2e/create_dummy_diffusion_data.py).
+2. Launch `verl_omni.trainer.main_diffusion` with model-specific
+   knobs (architecture, prompt template, CFG parameters, sequence
+   lengths).
+3. Assert exit code `0`.
+
+Then register the script in
+[`tests/gpu_smoke/run_gpu_smoke_diffusion_e2e.sh`](../../tests/gpu_smoke/run_gpu_smoke_diffusion_e2e.sh)
+as a new numbered test entry. The runner already exports
+`PYTHONUNBUFFERED=1` and `RAY_DEDUP_LOGS=0` for readable logs — no need
+to set them in your script.
+
+---
+
+## When to Refactor Instead of Duplicating
+
+If you are copy-pasting more than a few lines from another model's
+adapter, prefer one of:
+
+- Extending [`pipelines/utils.py`](../../verl_omni/pipelines/utils.py)
+  with a generic helper.
+- Adding a method to `DiffusionModelBase` or `VllmOmniPipelineBase` so
+  future models do not re-discover the contract.
+- Promoting a helper to a shared module once a second model needs it.
+
+Refactor opportunistically: keep model-specific quirks local until a
+third model demands the same code, then unify.
+
+---
+
+## Final Checklist
+
+Before opening the PR, confirm every box:
+
+- [ ] Prompt tokenisation follows [Prompt Tokenisation](#prompt-tokenisation-agent-loop--rollout):
+      single-encoder diffusion prompts use `prompt_ids`; multi-encoder models
+      configure `extra_tokenizers` and a token-id-native rollout encoder
+      (no decode-and-re-encode in the pipeline).
+- [ ] `verl_omni/pipelines/<model>_flow_grpo/` contains `__init__.py`,
+      `diffusers_training_adapter.py`, and `vllm_omni_rollout_adapter.py`.
+- [ ] [`verl_omni/pipelines/__init__.py`](../../verl_omni/pipelines/__init__.py)
+      imports the new package.
+- [ ] Architecture string on both `@register(...)` decorators matches
+      `model_index.json::_class_name`; the `algorithm=` keyword matches
+      the algorithm you are integrating against (e.g. `"flow_grpo"` for
+      FlowGRPO).
+- [ ] The registered pipeline declares `diffusion_io_spec.artifacts`, verifies
+      real VAE/packed latent layouts, and emits named outputs from every supported
+      execution mode. Runtime FPS/sample rate and primary/preview/audio selectors
+      must be explicit; missing requested media must fail, never fall back.
+- [ ] Scheduler returns latents in fp32 (no `model_output.dtype` cast in `step()`),
+      `diffuse()` casts to model dtype before transformer forward and casts
+      noise_pred to float32 before `scheduler.step()`
+      — see [Common Pitfalls](common_pitfalls.md#float32-precision-loss-in-stored-rollout-latents).
+- [ ] Any new `DiffusionPipelineConfig` field is mirrored in **both**
+      [`diffusion_rollout.yaml`](../../verl_omni/trainer/config/diffusion/rollout/diffusion_rollout.yaml)
+      and
+      [`diffusion_model.yaml`](../../verl_omni/trainer/config/diffusion/model/diffusion_model.yaml).
+- [ ] Example launch script in `examples/flowgrpo_trainer/` plus a
+      matching data preprocessor under
+      `examples/flowgrpo_trainer/data_process/`.
+- [ ] Smoke test `tests/special_e2e/run_<algo>_<model>.sh` exists and
+      is wired into
+      [`tests/gpu_smoke/run_gpu_smoke_diffusion_e2e.sh`](../../tests/gpu_smoke/run_gpu_smoke_diffusion_e2e.sh).
+- [ ] Docs updated (this guide if the contract changed; the relevant
+      `docs/algo/...` page if you introduce algorithm-level concepts).

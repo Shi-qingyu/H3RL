@@ -1,0 +1,836 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import math
+import os
+
+import numpy as np
+import pytest
+import torch
+from omegaconf import OmegaConf
+
+from verl_omni.trainer.diffusion import diffusion_algos
+from verl_omni.workers.config.diffusion.actor import DiffusionActorConfig, DiffusionLossConfig
+
+
+@pytest.mark.parametrize("missing_modality", ["video", "audio"])
+@pytest.mark.parametrize("explicit_null", [False, True])
+def test_omni_nft_rejects_missing_routing_weight(missing_modality, explicit_null):
+    weights = {"video": 1.0, "audio": 1.0}
+    if explicit_null:
+        weights[missing_modality] = None
+    else:
+        del weights[missing_modality]
+    with pytest.raises(ValueError, match=rf"Reward 'quality' must define routing_weights\.{missing_modality}"):
+        diffusion_algos.OmniNFTLoss._build_reward_routing_matrix(
+            reward_names=["quality"],
+            reward_functions={"quality": {"routing_weights": weights}},
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+
+@pytest.mark.parametrize("overrides", [{}, {"video_ref_kl_coef": 1e-4, "audio_ref_kl_coef": 1e-4}])
+def test_omni_nft_loss_with_declared_config(overrides):
+    config = DiffusionActorConfig(
+        strategy="fsdp2", rollout_n=1, diffusion_loss=DiffusionLossConfig(loss_mode="omni_nft", **overrides)
+    )
+    inputs = {}
+    predictions = []
+    for modality, length in (("video", 3), ("audio", 2)):
+        prediction = torch.full((2, length, 4), 0.2, requires_grad=True)
+        predictions.append(prediction)
+        inputs.update(
+            {
+                f"{modality}_forward_prediction": prediction,
+                f"{modality}_old_prediction": torch.zeros_like(prediction),
+                f"{modality}_ref_forward_prediction": torch.zeros_like(prediction),
+                f"{modality}_x0": torch.zeros_like(prediction),
+                f"{modality}_xt": torch.ones_like(prediction),
+                f"{modality}_t_expanded": torch.full((2, 1, 1), 0.5),
+                f"{modality}_reward_prob": torch.tensor([0.7, 0.8]),
+            }
+        )
+    loss, metrics = diffusion_algos.OmniNFTLoss.compute_loss(config=config, **inputs)
+    expected = (
+        sum(
+            metrics[f"actor/{modality}/policy_loss"]
+            + overrides.get(f"{modality}_ref_kl_coef", 0.0) * metrics[f"actor/{modality}/ref_kl_loss"]
+            for modality in ("video", "audio")
+        )
+        / 2
+    )
+    assert loss.item() == pytest.approx(expected)
+    loss.backward()
+    for prediction in predictions:
+        assert prediction.grad is not None
+        assert torch.isfinite(prediction.grad).all()
+        assert prediction.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("actor_config", [{}, {"enable_timestep_staging": False}, {"enable_timestep_staging": True}])
+def test_omni_nft_trainer_rejects_timestep_staging(actor_config):
+    config = OmegaConf.create({"algorithm": {}, "actor_rollout_ref": {"actor": actor_config}})
+    loss = diffusion_algos.get_diffusion_loss_fn("omni_nft")
+    if actor_config.get("enable_timestep_staging", False):
+        with pytest.raises(ValueError, match="actor_rollout_ref.actor.enable_timestep_staging=False"):
+            loss.validate_trainer_config(config)
+    else:
+        loss.validate_trainer_config(config)
+
+
+@pytest.mark.parametrize("key,value", [("train_timestep_range", [0, 2]), ("train_timestep_count", 2)])
+def test_omni_nft_retains_base_trainer_validation(key, value):
+    """OmniNFT keeps the base rejection of the DGPO/AWM timestep knobs."""
+    config = OmegaConf.create({"algorithm": {key: value}, "actor_rollout_ref": {"actor": {}}})
+    with pytest.raises(ValueError, match=f"algorithm.{key} is only used by the dgpo and awm losses"):
+        diffusion_algos.get_diffusion_loss_fn("omni_nft").validate_trainer_config(config)
+
+
+@pytest.mark.parametrize("norm_adv_by_std_in_grpo", [True, False])
+@pytest.mark.parametrize("global_std", [True, False])
+def test_flow_grpo_advantage_return(norm_adv_by_std_in_grpo: bool, global_std: bool) -> None:
+    batch_size = 8
+    steps = 10
+    sample_level_rewards = torch.randn((batch_size, steps), dtype=torch.float32)
+    uid = np.array([f"uid-{idx}" for idx in range(batch_size)], dtype=object)
+
+    advantages, returns = diffusion_algos.compute_flow_grpo_outcome_advantage(
+        sample_level_rewards=sample_level_rewards,
+        index=uid,
+        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        global_std=global_std,
+    )
+
+    assert advantages.shape == returns.shape == (batch_size, steps)
+
+
+def test_dance_grpo_loss_registered_and_callable():
+    """``dance_grpo`` loss function is registered and can be invoked."""
+    from hydra import compose, initialize_config_dir
+    from verl.utils.config import omega_conf_to_dataclass
+
+    from verl_omni.workers.config.diffusion.actor import FSDPDiffusionActorConfig
+
+    batch_size = 8
+    rollout_log_probs = torch.randn((batch_size,), dtype=torch.float32)
+    current_log_probs = torch.randn((batch_size,), dtype=torch.float32)
+    advantages = torch.randn((batch_size,), dtype=torch.float32)
+
+    with initialize_config_dir(
+        config_dir=os.path.abspath("verl_omni/trainer/config/diffusion/actor"), version_base=None
+    ):
+        cfg = compose(
+            config_name="dp_diffusion_actor",
+            overrides=[
+                "strategy=fsdp",
+                "diffusion_loss.loss_mode=dance_grpo",
+                "diffusion_loss.clip_ratio=0.0001",
+                "diffusion_loss.adv_clip_max=5.0",
+                "ppo_micro_batch_size_per_gpu=8",
+            ],
+        )
+    actor_config: FSDPDiffusionActorConfig = omega_conf_to_dataclass(cfg)
+
+    dance_grpo_loss = diffusion_algos.get_diffusion_loss_fn("dance_grpo")
+    pg_loss, pg_metrics = dance_grpo_loss.compute_loss(
+        old_log_prob=rollout_log_probs,
+        log_prob=current_log_probs,
+        advantages=advantages,
+        config=actor_config,
+    )
+
+    assert pg_loss.shape == ()
+    assert isinstance(pg_loss.item(), float)
+    for key in ("actor/ppo_kl", "actor/pg_clipfrac", "actor/pg_clipfrac_higher", "actor/pg_clipfrac_lower"):
+        assert key in pg_metrics
+
+
+@pytest.mark.parametrize("norm_adv_by_std_in_grpo", [True, False])
+@pytest.mark.parametrize("global_std", [True, False])
+def test_flow_grpo_advantage_grouped_uids(norm_adv_by_std_in_grpo: bool, global_std: bool) -> None:
+    """Exercises the len > 1 branch: multiple samples sharing the same prompt UID."""
+    steps = 5
+    # 4 samples: uid-0 × 2, uid-1 × 2  →  2 groups of size 2
+    group_rewards = torch.tensor(
+        [[1.0] * steps, [3.0] * steps, [0.0] * steps, [2.0] * steps],
+        dtype=torch.float32,
+    )
+    uid = np.array(["uid-0", "uid-0", "uid-1", "uid-1"], dtype=object)
+
+    advantages, returns = diffusion_algos.compute_flow_grpo_outcome_advantage(
+        sample_level_rewards=group_rewards,
+        index=uid,
+        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        global_std=global_std,
+    )
+
+    assert advantages.shape == returns.shape == (4, steps)
+
+    if not norm_adv_by_std_in_grpo:
+        # Without std scaling: advantage = reward - group_mean
+        # group uid-0 mean = (1+3)/2 = 2.0  →  advantages: -1, +1
+        # group uid-1 mean = (0+2)/2 = 1.0  →  advantages: -1, +1
+        torch.testing.assert_close(advantages[0], torch.full((steps,), -1.0))
+        torch.testing.assert_close(advantages[1], torch.full((steps,), 1.0))
+        torch.testing.assert_close(advantages[2], torch.full((steps,), -1.0))
+        torch.testing.assert_close(advantages[3], torch.full((steps,), 1.0))
+    else:
+        # With std scaling: mean should be 0 for each group
+        torch.testing.assert_close(advantages[0:2].mean(), torch.tensor(0.0), atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(advantages[2:4].mean(), torch.tensor(0.0), atol=1e-6, rtol=1e-6)
+
+
+def test_compute_policy_loss_flow_grpo() -> None:
+    from hydra import compose, initialize_config_dir
+    from verl.utils.config import omega_conf_to_dataclass
+
+    from verl_omni.workers.config.diffusion.actor import FSDPDiffusionActorConfig
+
+    batch_size = 8
+    steps = 10
+    rollout_log_probs = torch.randn((batch_size, steps), dtype=torch.float32)
+    current_log_probs = torch.randn((batch_size, steps), dtype=torch.float32)
+    advantages = torch.randn((batch_size, steps), dtype=torch.float32)
+
+    with initialize_config_dir(
+        config_dir=os.path.abspath("verl_omni/trainer/config/diffusion/actor"), version_base=None
+    ):
+        cfg = compose(
+            config_name="dp_diffusion_actor",
+            overrides=[
+                "strategy=fsdp",
+                "diffusion_loss.clip_ratio=0.0001",
+                "diffusion_loss.adv_clip_max=5.0",
+                "ppo_micro_batch_size_per_gpu=8",
+            ],
+        )
+    actor_config: FSDPDiffusionActorConfig = omega_conf_to_dataclass(cfg)
+
+    flow_grpo_loss = diffusion_algos.get_diffusion_loss_fn("flow_grpo")
+    for step in range(steps):
+        pg_loss, pg_metrics = flow_grpo_loss.compute_loss(
+            old_log_prob=rollout_log_probs[:, step],
+            log_prob=current_log_probs[:, step],
+            advantages=advantages[:, step],
+            config=actor_config,
+        )
+
+        assert pg_loss.shape == ()
+        assert isinstance(pg_loss.item(), float)
+        assert "actor/ppo_kl" in pg_metrics
+        assert "actor/pg_clipfrac" in pg_metrics
+        assert "actor/pg_clipfrac_higher" in pg_metrics
+        assert "actor/pg_clipfrac_lower" in pg_metrics
+
+
+def test_flow_grpo_loss_with_zeroed_pad_rows() -> None:
+    """Pad rows zeroed by the v1 sync trainer must not bias the FlowGRPO objective (#561).
+
+    ``_balance_batch`` pads by duplicating real rows. With the duplicated real
+    advantages still in place the unmasked mean is inflated; after
+    ``_zero_pad_row_advantages`` the loss is ``sum(real per_elem) / (N + P)`` —
+    a uniform 1/(N+P) scale, deliberately not the unpadded mean, which would
+    require a masked reduction or unpad-before-loss.
+    """
+    from hydra import compose, initialize_config_dir
+    from verl.utils.config import omega_conf_to_dataclass
+
+    from verl_omni.workers.config.diffusion.actor import FSDPDiffusionActorConfig
+
+    n_real, n_pad = 4, 2
+    old_log_prob = torch.tensor([0.1, 0.2, 0.3, 0.4])
+    log_prob = torch.tensor([0.15, 0.1, 0.5, 0.2])
+    advantages = torch.tensor([1.0, -2.0, 3.0, -4.0])
+
+    with initialize_config_dir(
+        config_dir=os.path.abspath("verl_omni/trainer/config/diffusion/actor"), version_base=None
+    ):
+        cfg = compose(
+            config_name="dp_diffusion_actor",
+            overrides=[
+                "strategy=fsdp",
+                "diffusion_loss.clip_ratio=0.2",
+                "diffusion_loss.adv_clip_max=5.0",
+            ],
+        )
+    actor_config: FSDPDiffusionActorConfig = omega_conf_to_dataclass(cfg)
+    flow_grpo_loss = diffusion_algos.get_diffusion_loss_fn("flow_grpo")
+    clip_ratio = actor_config.diffusion_loss.clip_ratio
+    adv_clip_max = actor_config.diffusion_loss.adv_clip_max
+
+    def per_elem_loss(adv: torch.Tensor, log_prob: torch.Tensor, old_log_prob: torch.Tensor) -> torch.Tensor:
+        adv = torch.clamp(adv, -adv_clip_max, adv_clip_max)
+        ratio = torch.exp(log_prob - old_log_prob)
+        return torch.maximum(-adv * ratio, -adv * torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio))
+
+    real_loss = per_elem_loss(advantages, log_prob, old_log_prob)
+    # pad_dataproto_to_divisor duplicates head rows onto the tail.
+    padded_old = torch.cat([old_log_prob, old_log_prob[:n_pad]])
+    padded_log = torch.cat([log_prob, log_prob[:n_pad]])
+
+    # Pre-fix: duplicated real advantages reach the unmasked mean and inflate it.
+    duplicated_adv = torch.cat([advantages, advantages[:n_pad]])
+    loss_duplicated, _ = flow_grpo_loss.compute_loss(
+        old_log_prob=padded_old, log_prob=padded_log, advantages=duplicated_adv, config=actor_config
+    )
+    torch.testing.assert_close(loss_duplicated, per_elem_loss(duplicated_adv, padded_log, padded_old).mean())
+    assert loss_duplicated > real_loss.mean()
+
+    # Post-fix: pad-row advantages zeroed, loss = sum(real per_elem) / (N + P).
+    zeroed_adv = torch.cat([advantages, torch.zeros(n_pad)])
+    loss_zeroed, _ = flow_grpo_loss.compute_loss(
+        old_log_prob=padded_old, log_prob=padded_log, advantages=zeroed_adv, config=actor_config
+    )
+    torch.testing.assert_close(loss_zeroed, real_loss.sum() / (n_real + n_pad))
+    assert not torch.isclose(loss_zeroed, real_loss.mean())
+
+
+def _reference_flow_dppo_loss(
+    *,
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    old_prev_sample_mean: torch.Tensor,
+    prev_sample_mean: torch.Tensor,
+    advantages: torch.Tensor,
+    sigma_t: torch.Tensor,
+    kl_mask_threshold: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute the expected Flow-DPPO KL-advantage masking math."""
+    log_diff = log_prob - old_log_prob
+    ratio = torch.exp(log_diff)
+    unclipped_loss = -advantages.detach() * ratio
+
+    kl_per_elem = (prev_sample_mean - old_prev_sample_mean).pow(2) / (2 * sigma_t.pow(2))
+    kl_per_sample = kl_per_elem.mean(dim=tuple(range(1, kl_per_elem.ndim)))
+    kl_mask = kl_per_sample < kl_mask_threshold
+    pos_rm_mask = (~kl_mask) & (ratio > 1.0) & (advantages > 0)
+    neg_rm_mask = (~kl_mask) & (ratio < 1.0) & (advantages < 0)
+    rm_mask = pos_rm_mask | neg_rm_mask
+    keep_mask = (~rm_mask).detach()
+    zero = torch.zeros((), dtype=unclipped_loss.dtype, device=unclipped_loss.device)
+    loss = torch.where(keep_mask, unclipped_loss, zero).mean()
+    return loss, {
+        "kl_per_sample": kl_per_sample,
+        "pos_rm_mask": pos_rm_mask,
+        "neg_rm_mask": neg_rm_mask,
+        "rm_mask": rm_mask,
+    }
+
+
+@pytest.mark.parametrize("add_kl_coefficient", [True, False])
+def test_compute_policy_loss_flow_dppo_applies_asymmetric_kl_mask(add_kl_coefficient: bool) -> None:
+    from hydra import compose, initialize_config_dir
+    from verl.utils.config import omega_conf_to_dataclass
+
+    from verl_omni.workers.config.diffusion.actor import FSDPDiffusionActorConfig
+
+    old_log_prob = torch.zeros(4, dtype=torch.float32)
+    log_prob = torch.log(torch.tensor([1.2, 0.8, 1.2, 0.8], dtype=torch.float32))
+    advantages = torch.tensor([10.0, -10.0, -8.0, 8.0], dtype=torch.float32)
+    old_prev_sample_mean = torch.zeros((4, 2, 2, 2), dtype=torch.float32)
+    prev_sample_mean = torch.full_like(old_prev_sample_mean, 0.2)
+    std_dev_t = torch.full((4, 1, 1, 1), 0.5, dtype=torch.float32)
+    sqrt_dt = torch.full((4,), 0.5, dtype=torch.float32)
+    kl_mask_threshold = 1e-5
+
+    with initialize_config_dir(
+        config_dir=os.path.abspath("verl_omni/trainer/config/diffusion/actor"), version_base=None
+    ):
+        cfg = compose(
+            config_name="dp_diffusion_actor",
+            overrides=[
+                "strategy=fsdp",
+                "diffusion_loss.loss_mode=flow_dppo",
+                f"diffusion_loss.add_kl_coefficient={str(add_kl_coefficient)}",
+                f"diffusion_loss.kl_mask_threshold={kl_mask_threshold}",
+                "diffusion_loss.adv_clip_max=5.0",
+                "ppo_micro_batch_size_per_gpu=4",
+            ],
+        )
+    actor_config: FSDPDiffusionActorConfig = omega_conf_to_dataclass(cfg)
+
+    flow_dppo_loss = diffusion_algos.get_diffusion_loss_fn("flow_dppo")
+    loss, metrics = flow_dppo_loss.compute_loss(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        config=actor_config,
+        old_prev_sample_mean=old_prev_sample_mean,
+        prev_sample_mean=prev_sample_mean,
+        std_dev_t=std_dev_t,
+        sqrt_dt=sqrt_dt,
+    )
+
+    if add_kl_coefficient:
+        sigma_t = std_dev_t * sqrt_dt.reshape(4, 1, 1, 1)
+    else:
+        sigma_t = torch.ones_like(std_dev_t)
+    ref_loss, ref_masks = _reference_flow_dppo_loss(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        old_prev_sample_mean=old_prev_sample_mean,
+        prev_sample_mean=prev_sample_mean,
+        advantages=advantages,
+        sigma_t=sigma_t,
+        kl_mask_threshold=kl_mask_threshold,
+    )
+
+    torch.testing.assert_close(loss, ref_loss)
+    clamped_advantages = torch.clamp(
+        advantages,
+        -actor_config.diffusion_loss.adv_clip_max,
+        actor_config.diffusion_loss.adv_clip_max,
+    )
+    clamped_ref_loss, _ = _reference_flow_dppo_loss(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        old_prev_sample_mean=old_prev_sample_mean,
+        prev_sample_mean=prev_sample_mean,
+        advantages=clamped_advantages,
+        sigma_t=sigma_t,
+        kl_mask_threshold=kl_mask_threshold,
+    )
+    assert not torch.isclose(loss, clamped_ref_loss)
+    assert ref_masks["pos_rm_mask"].tolist() == [True, False, False, False]
+    assert ref_masks["neg_rm_mask"].tolist() == [False, True, False, False]
+    assert ref_masks["rm_mask"].tolist() == [True, True, False, False]
+    assert metrics["actor/masked_fraction"] == pytest.approx(0.5)
+    assert metrics["actor/unmasked_fraction"] == pytest.approx(0.5)
+    assert "actor/kl_new_old_mean" in metrics
+
+
+@pytest.mark.parametrize("norm_by_std", [True, False])
+@pytest.mark.parametrize("global_std", [True, False])
+def test_compute_diffusion_nft_group_advantages(norm_by_std: bool, global_std: bool) -> None:
+    # 4 samples in 2 groups of 2
+    rewards = torch.tensor([1.0, 3.0, 0.0, 2.0])
+    uid = np.array(["uid-0", "uid-0", "uid-1", "uid-1"], dtype=object)
+
+    advantages = diffusion_algos.DiffusionNFTLoss._compute_group_advantages(
+        rewards=rewards, uid=uid, norm_by_std=norm_by_std, global_std=global_std
+    )
+
+    assert advantages.shape == (4,)
+    if not norm_by_std:
+        torch.testing.assert_close(advantages[0], torch.tensor(-1.0), atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(advantages[1], torch.tensor(1.0), atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(advantages[2], torch.tensor(-1.0), atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(advantages[3], torch.tensor(1.0), atol=1e-5, rtol=1e-5)
+    else:
+        # group means are zero after std normalization
+        torch.testing.assert_close(advantages[0:2].mean(), torch.tensor(0.0), atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(advantages[2:4].mean(), torch.tensor(0.0), atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("adv_mode", ["continuous", "positive_only", "negative_only", "one_only", "binary"])
+def test_diffusion_nft_advantage_to_reward_prob(adv_mode: str) -> None:
+    adv_clip_max = 5.0
+    advantages = torch.tensor([-10.0, -5.0, 0.0, 5.0, 10.0])
+
+    reward_prob = diffusion_algos.DiffusionNFTLoss._advantage_to_reward_prob(
+        advantages, adv_clip_max=adv_clip_max, adv_mode=adv_mode
+    )
+
+    assert reward_prob.shape == advantages.shape
+    assert (reward_prob >= 0).all() and (reward_prob <= 1).all(), "reward_prob must be in [0, 1]"
+
+    if adv_mode == "continuous":
+        # clipped to [-5, 5] → mapped to [0, 1]
+        torch.testing.assert_close(reward_prob[1], torch.tensor(0.0), atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(reward_prob[2], torch.tensor(0.5), atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(reward_prob[3], torch.tensor(1.0), atol=1e-5, rtol=1e-5)
+    elif adv_mode == "positive_only":
+        assert (reward_prob >= 0.5).all()
+    elif adv_mode == "negative_only":
+        assert (reward_prob <= 0.5).all()
+    elif adv_mode == "one_only":
+        # advantages binarized to {0, 1}, then mapped via (adv / adv_clip_max) / 2 + 0.5
+        torch.testing.assert_close(reward_prob[0:3], torch.full((3,), 0.5), atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(reward_prob[3:5], torch.full((2,), 0.6), atol=1e-5, rtol=1e-5)
+    elif adv_mode == "binary":
+        # advantages signed to {-1, 0, 1}, then mapped via (adv / adv_clip_max) / 2 + 0.5
+        torch.testing.assert_close(reward_prob[0:2], torch.full((2,), 0.4), atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(reward_prob[2], torch.tensor(0.5), atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(reward_prob[3:5], torch.full((2,), 0.6), atol=1e-5, rtol=1e-5)
+
+
+def test_prepare_diffusion_nft_actor_batch() -> None:
+    from types import SimpleNamespace
+
+    from verl import DataProto
+
+    B, T, C, H, W = 4, 6, 4, 8, 8
+    rewards = torch.randn(B)
+    uid = np.array([f"uid-{i // 2}" for i in range(B)], dtype=object)
+    batch = DataProto.from_dict(
+        tensors={
+            "latents_clean": torch.randn(B, C, H, W),
+            "train_timesteps": torch.randint(0, 1000, (B, T)),
+            "prompts": torch.zeros(B, 16, dtype=torch.long),
+        },
+        non_tensors={"uid": uid},
+    )
+    algorithm_config = SimpleNamespace(
+        norm_adv_by_std_in_grpo=True,
+        global_std=True,
+        adv_mode="continuous",
+        timestep_fraction=0.5,
+    )
+    config = SimpleNamespace(
+        algorithm=algorithm_config,
+        actor_rollout_ref=SimpleNamespace(
+            actor=SimpleNamespace(
+                diffusion_loss=SimpleNamespace(adv_clip_max=5.0),
+                data_loader_seed=42,
+            )
+        ),
+    )
+
+    result = diffusion_algos.DiffusionNFTLoss.prepare_actor_batch(batch, rewards, config)
+
+    num_train = max(1, int(T * algorithm_config.timestep_fraction))
+    assert result.batch["train_timesteps"].shape == (B, num_train)
+    assert result.batch["advantages"].shape == (B, num_train)
+    assert result.batch["reward_prob"].shape == (B, num_train)
+    assert result.batch["returns"].shape == (B, num_train)
+    assert result.batch["sample_level_rewards"].shape == (B, num_train)
+    assert ((result.batch["reward_prob"] >= 0) & (result.batch["reward_prob"] <= 1)).all()
+
+
+def test_prepare_omni_nft_actor_batch_restores_single_component_axis() -> None:
+    from types import SimpleNamespace
+
+    from verl import DataProto
+
+    batch_size, num_timesteps = 4, 6
+    scores = torch.tensor([[1.0], [0.0], [0.2], [0.8]])
+    batch = DataProto.from_dict(
+        tensors={
+            "video_latents_clean": torch.randn(batch_size, 4, 2),
+            "audio_latents_clean": torch.randn(batch_size, 4, 2),
+            "train_timesteps": torch.randint(0, 1000, (batch_size, num_timesteps)),
+            "rm_scores": scores,
+        },
+        non_tensors={"uid": np.array(["p0", "p0", "p1", "p1"], dtype=object)},
+        meta_info={"reward_names": ["quality"]},
+    )
+    config = SimpleNamespace(
+        algorithm=SimpleNamespace(
+            norm_adv_by_std_in_grpo=True,
+            global_std=True,
+            adv_mode="continuous",
+            timestep_fraction=0.5,
+        ),
+        actor_rollout_ref=SimpleNamespace(
+            actor=SimpleNamespace(
+                diffusion_loss=SimpleNamespace(adv_clip_max=5.0),
+                data_loader_seed=42,
+            )
+        ),
+        reward=SimpleNamespace(
+            reward_functions={
+                "quality": {"routing_weights": {"video": 1.0, "audio": 1.0}},
+            }
+        ),
+    )
+
+    result = diffusion_algos.OmniNFTLoss.prepare_actor_batch(batch, scores.squeeze(-1), config)
+
+    selected_timesteps = max(1, int(num_timesteps * config.algorithm.timestep_fraction))
+    centered = torch.tensor([[0.5], [-0.5], [-0.3], [0.3]])
+    expected_prob = 0.5 + 0.5 * centered / (scores.std(correction=0) + 1e-4) / 5.0
+    torch.testing.assert_close(result.batch["reward_prob"], expected_prob[:, None, :].expand(-1, selected_timesteps, 2))
+    assert result.batch["reward_prob"].shape == (batch_size, selected_timesteps, 2)
+    assert result.batch["sample_level_rewards"].shape == (batch_size, 1)
+
+
+def test_prepare_online_dpo_actor_batch() -> None:
+    from types import SimpleNamespace
+
+    from verl import DataProto
+
+    # Two prompts, two rollouts each; rewards pick high/low per uid.
+    uid = np.array(["p0", "p0", "p1", "p1"], dtype=object)
+    rewards = torch.tensor([1.0, 0.0, 0.5, 1.0])
+    batch = DataProto.from_dict(
+        tensors={"sample_level_scores": rewards.clone()},
+        non_tensors={"uid": uid},
+    )
+    config = SimpleNamespace(algorithm=SimpleNamespace(sample_source="online"))
+
+    result = diffusion_algos.DPOLoss.prepare_actor_batch(batch, rewards, config)
+
+    assert len(result) == 4
+    assert list(result.non_tensor_batch["uid"]) == ["p0", "p0", "p1", "p1"]
+    chosen_rejected = result.batch["sample_level_scores"].squeeze(-1)
+    assert chosen_rejected[0] >= chosen_rejected[1]
+    assert chosen_rejected[2] >= chosen_rejected[3]
+
+
+def test_compute_policy_loss_diffusion_nft() -> None:
+    from hydra import compose, initialize_config_dir
+    from verl.utils.config import omega_conf_to_dataclass
+
+    from verl_omni.workers.config.diffusion.actor import FSDPDiffusionActorConfig
+
+    B, C, H, W = 4, 4, 8, 8
+    x0 = torch.randn(B, C, H, W)
+    xt = torch.randn(B, C, H, W)
+    t_expanded = torch.full((B, C, H, W), 0.5)
+    forward_prediction = torch.randn(B, C, H, W)
+    old_prediction = torch.randn(B, C, H, W)
+    ref_forward_prediction = torch.randn(B, C, H, W)
+    reward_prob = torch.rand(B)
+
+    with initialize_config_dir(
+        config_dir=os.path.abspath("verl_omni/trainer/config/diffusion/actor"), version_base=None
+    ):
+        cfg = compose(
+            config_name="dp_diffusion_actor",
+            overrides=[
+                "strategy=fsdp",
+                "diffusion_loss.loss_mode=diffusion_nft",
+                "diffusion_loss.adv_clip_max=5.0",
+                "ppo_micro_batch_size_per_gpu=4",
+            ],
+        )
+    actor_config: FSDPDiffusionActorConfig = omega_conf_to_dataclass(cfg)
+
+    nft_loss = diffusion_algos.get_diffusion_loss_fn("diffusion_nft")
+    loss, metrics = nft_loss.compute_loss(
+        forward_prediction=forward_prediction,
+        old_prediction=old_prediction,
+        ref_forward_prediction=ref_forward_prediction,
+        x0=x0,
+        xt=xt,
+        t_expanded=t_expanded,
+        reward_prob=reward_prob,
+        config=actor_config,
+    )
+
+    assert loss.shape == ()
+    assert isinstance(loss.item(), float)
+    for key in (
+        "actor/policy_loss",
+        "actor/positive_loss",
+        "actor/negative_loss",
+        "actor/contraction_scale",
+        "actor/reward_term_scale",
+        "actor/log10_signal_ratio",
+        "actor/ref_kl_loss",
+        "actor/ref_kl_contribution",
+        "actor/old_deviate",
+        "actor/reward_prob_mean",
+        "actor/total_loss",
+    ):
+        assert key in metrics, key
+
+
+def test_diffusion_nft_reward_signal_scaling() -> None:
+    """Pin the gradient decomposition that the DiffusionNFT recipe knobs trade against.
+
+    Because `old_prediction` is detached, `dL/dv_theta` splits into exactly two parts (with
+    `A = adv_clip_max` and `w` the per-branch adaptive weight):
+
+        dL/dv_theta  ~  A*2/w * ( [ beta * t * (v_theta - v_old) ]  -  [ 2*(r-0.5) * (x0_old - x0) ] )
+                                 \\____________ A * beta ____________/     \\_______ adv, no A _______/
+
+    The `1/beta` in `policy_loss_per_sample` is cancelled by `dx0/dv_theta = -+t*beta`, so the
+    contraction scales with `A * beta` while the reward term scales with neither: it reduces to
+    `adv * (x0_old - x0)` because `r - 0.5 = adv / (2*A)` and the loss then multiplies by `A`. That
+    asymmetry is the whole basis for what the shipped recipe changes: lowering `adv_clip_max` from
+    5.0 to 1.0 cuts the reward-free contraction 5x while leaving the learning signal intact,
+    whereas *raising* `mix_beta` does the opposite -- it strengthens the contraction, so it is a
+    signal-to-noise trade rather than a free win.
+
+    The reported loss values hide all of this: `positive_loss`/`negative_loss` are dominated by a
+    `1/beta` term whose gradient is `beta`-proportional, which is why the collapsed run showed
+    `positive_loss` steadily *improving* while the graded reward fell.
+    """
+    from hydra import compose, initialize_config_dir
+    from verl.utils.config import omega_conf_to_dataclass
+
+    from verl_omni.workers.config.diffusion.actor import FSDPDiffusionActorConfig
+
+    torch.manual_seed(0)
+    B, C, H, W = 8, 4, 8, 8
+    x0 = torch.randn(B, C, H, W)
+    xt = torch.randn(B, C, H, W)
+    t_expanded = torch.full((B, C, H, W), 0.5)
+    # A small `v_theta - v_old` keeps the branches close, which is the collapsing-run regime that
+    # motivated the instrumented metrics.
+    old_prediction = torch.randn(B, C, H, W)
+    forward_prediction = old_prediction + 0.02 * torch.randn(B, C, H, W)
+    ref_forward_prediction = torch.zeros_like(old_prediction)
+    # Keep |adv| < 1 so neither setting clips: that is where the `adv_clip_max` cancellation is
+    # exact, isolated from the probability map's saturation (covered by the second half below).
+    advantages = 0.3 * torch.randn(B)
+
+    def metrics_for(
+        mix_beta: float, adv_clip_max: float, adv_raw: torch.Tensor | None = None, ref_kl_coef: float | None = None
+    ) -> dict:
+        reward_prob = diffusion_algos.DiffusionNFTLoss._advantage_to_reward_prob(
+            (advantages if adv_raw is None else adv_raw).clone(), adv_clip_max, "continuous"
+        )
+        with initialize_config_dir(
+            config_dir=os.path.abspath("verl_omni/trainer/config/diffusion/actor"), version_base=None
+        ):
+            cfg = compose(
+                config_name="dp_diffusion_actor",
+                overrides=[
+                    "strategy=fsdp",
+                    "diffusion_loss.loss_mode=diffusion_nft",
+                    f"diffusion_loss.mix_beta={mix_beta}",
+                    f"diffusion_loss.adv_clip_max={adv_clip_max}",
+                    # Left at the config default when unset, which is how the audit below detects
+                    # that `ref_kl_coef` contributes nothing out of the box.
+                    *([f"diffusion_loss.ref_kl_coef={ref_kl_coef}"] if ref_kl_coef is not None else []),
+                    "ppo_micro_batch_size_per_gpu=4",
+                ],
+            )
+        actor_config: FSDPDiffusionActorConfig = omega_conf_to_dataclass(cfg)
+        nft_loss = diffusion_algos.get_diffusion_loss_fn("diffusion_nft")
+        _, metrics = nft_loss.compute_loss(
+            forward_prediction=forward_prediction,
+            old_prediction=old_prediction,
+            ref_forward_prediction=ref_forward_prediction,
+            x0=x0,
+            xt=xt,
+            t_expanded=t_expanded,
+            reward_prob=reward_prob,
+            config=actor_config,
+        )
+        return metrics
+
+    inherited = metrics_for(mix_beta=0.1, adv_clip_max=5.0)
+    rebalanced = metrics_for(mix_beta=0.1, adv_clip_max=1.0)
+
+    # `A` cancels out of `reward_term` exactly (`reward_weight - 0.5 = clamp(adv,-A,A)/(2A)`), so
+    # lowering `A` cuts only the reward-free contraction: this is the recipe's 5.0 -> 1.0.
+    assert rebalanced["actor/contraction_scale"] < inherited["actor/contraction_scale"] / 4.0
+    assert rebalanced["actor/reward_term_scale"] == pytest.approx(inherited["actor/reward_term_scale"], rel=0.05)
+    # The gain is exact in log space; the raw ratio is a mean-of-ratios that a rounded-to-zero
+    # micro-batch would blow up. Every |adv| < 1 here, so neither setting clips.
+    assert rebalanced["actor/log10_signal_ratio"] == pytest.approx(
+        inherited["actor/log10_signal_ratio"] + math.log10(5.0), abs=0.05
+    )
+
+    # `mix_beta` moves the other way: it scales the contraction and leaves the reward term alone, so
+    # raising it is *not* a free reduction of the reward-free floor. Pinned here so the recipe's 0.1
+    # is not "fixed" upward later on the mistaken belief that it buys signal-to-noise.
+    raised_beta = metrics_for(mix_beta=1.0, adv_clip_max=5.0)
+    assert raised_beta["actor/contraction_scale"] > inherited["actor/contraction_scale"] * 8.0
+    assert raised_beta["actor/reward_term_scale"] == pytest.approx(inherited["actor/reward_term_scale"], rel=0.05)
+
+    # With realistically-scaled advantages, `adv_clip_max=1.0` does clip beyond +-1 and so damps
+    # those samples' weight -- the intended map, and it must cost only a bounded amount.
+    raw_advantages = torch.randn(B)
+    unit_inherited = metrics_for(mix_beta=0.1, adv_clip_max=5.0, adv_raw=raw_advantages)
+    unit_rebalanced = metrics_for(mix_beta=0.1, adv_clip_max=1.0, adv_raw=raw_advantages)
+    assert unit_rebalanced["actor/reward_term_scale"] > 0.5 * unit_inherited["actor/reward_term_scale"]
+    # Clipping damps the reward weight of the saturated samples, so the ratio gain is smaller than
+    # the unclipped 5x -- but it still has to improve substantially, not collapse.
+    assert unit_rebalanced["actor/log10_signal_ratio"] > unit_inherited["actor/log10_signal_ratio"] + 0.4
+
+    # The KL anchor ships at `ref_kl_coef=0.0`, so the inherited term contributes exactly
+    # nothing and `adv_clip_max` is the only knob doing work. Pinned so that a future default
+    # change cannot quietly make the anchor load-bearing without the audit below being revisited.
+    assert inherited["actor/ref_kl_contribution"] == pytest.approx(0.0, abs=1e-12)
+
+    # The other half of the recipe: `ref_kl_coef` 0.0 -> 10.0 must be a real term shaping the
+    # update, not a decorative one -- substantial, yet not swamping `policy_loss`.
+    anchored = metrics_for(mix_beta=0.1, adv_clip_max=1.0, ref_kl_coef=10.0)
+    assert anchored["actor/ref_kl_contribution"] > 1.0
+    assert anchored["actor/ref_kl_contribution"] < anchored["actor/total_loss"]
+    # ~0.36 of the reported loss at these fixtures.
+    assert 0.2 < anchored["actor/ref_kl_contribution"] / anchored["actor/total_loss"] < 0.6
+    # The anchor is additive: on the identical policy objective it must leave `policy_loss` and the
+    # reward decomposition untouched, otherwise `ref_kl_coef` would be re-scaling the reward signal.
+    assert anchored["actor/policy_loss"] == pytest.approx(rebalanced["actor/policy_loss"], rel=1e-6)
+    assert anchored["actor/log10_signal_ratio"] == pytest.approx(rebalanced["actor/log10_signal_ratio"], rel=1e-6)
+
+
+def test_compute_policy_loss_grpo_guard() -> None:
+    from hydra import compose, initialize_config_dir
+    from verl.utils.config import omega_conf_to_dataclass
+
+    from verl_omni.workers.config.diffusion.actor import FSDPDiffusionActorConfig
+
+    batch_size = 4
+    rollout_log_probs = torch.randn((batch_size,), dtype=torch.float32)
+    current_log_probs = torch.randn((batch_size,), dtype=torch.float32)
+    advantages = torch.randn((batch_size,), dtype=torch.float32)
+    old_prev_sample_mean = torch.randn((batch_size, 16, 8, 8), dtype=torch.float32)
+    prev_sample_mean = old_prev_sample_mean + 0.01 * torch.randn_like(old_prev_sample_mean)
+    std_dev_t = torch.full((batch_size, 1, 1, 1), 0.5, dtype=torch.float32)
+    sqrt_dt = torch.full((batch_size,), 0.3, dtype=torch.float32)
+
+    with initialize_config_dir(
+        config_dir=os.path.abspath("verl_omni/trainer/config/diffusion/actor"), version_base=None
+    ):
+        cfg = compose(
+            config_name="dp_diffusion_actor",
+            overrides=[
+                "strategy=fsdp",
+                "diffusion_loss.loss_mode=grpo_guard",
+                "diffusion_loss.clip_ratio=2e-6",
+                "diffusion_loss.adv_clip_max=5.0",
+                "ppo_micro_batch_size_per_gpu=8",
+            ],
+        )
+    actor_config: FSDPDiffusionActorConfig = omega_conf_to_dataclass(cfg)
+
+    grpo_guard_loss = diffusion_algos.get_diffusion_loss_fn("grpo_guard")
+    pg_loss, pg_metrics = grpo_guard_loss.compute_loss(
+        old_log_prob=rollout_log_probs,
+        log_prob=current_log_probs,
+        advantages=advantages,
+        config=actor_config,
+        old_prev_sample_mean=old_prev_sample_mean,
+        prev_sample_mean=prev_sample_mean,
+        std_dev_t=std_dev_t,
+        sqrt_dt=sqrt_dt,
+    )
+
+    assert pg_loss.shape == ()
+    assert isinstance(pg_loss.item(), float)
+    for key in (
+        "actor/ppo_kl",
+        "actor/pg_clipfrac",
+        "actor/pg_clipfrac_higher",
+        "actor/pg_clipfrac_lower",
+        "actor/ratio_mean",
+        "actor/ratio_std",
+    ):
+        assert key in pg_metrics, key
+
+
+@pytest.mark.parametrize("norm_adv_by_std_in_grpo", [True, False])
+@pytest.mark.parametrize("global_std", [True, False])
+def test_dance_grpo_advantage_return(norm_adv_by_std_in_grpo: bool, global_std: bool) -> None:
+    """``dance_grpo`` reuses the ``flow_grpo`` advantage estimator."""
+    batch_size = 8
+    steps = 10
+    sample_level_rewards = torch.randn((batch_size, steps), dtype=torch.float32)
+    uid = np.array([f"uid-{idx}" for idx in range(batch_size)], dtype=object)
+
+    advantages, returns = diffusion_algos.compute_flow_grpo_outcome_advantage(
+        sample_level_rewards=sample_level_rewards,
+        index=uid,
+        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        global_std=global_std,
+    )
+
+    assert advantages.shape == returns.shape == (batch_size, steps)

@@ -1,0 +1,455 @@
+# defaults specify the default config from each component
+defaults:
+
+  # per-role profiler config, inheriting from trainer/config/profiler/profiler.yaml
+  - ../../profiler@profiler: profiler
+
+  # load the reference default config, then apply the fields in the current yaml
+  - _self_
+
+# Target class for this configuration
+_target_: verl_omni.workers.config.diffusion.DiffusionRolloutConfig
+
+# actor_rollout_ref.rollout.name: vllm_omni. The default value will be removed in the future
+name: ???
+
+# Rollout mode. Only async is supported.
+mode: async
+
+# Number of nodes for standalone rollout server, must be > 0 in one-step-off/fully async training.
+nnodes: 0
+
+# Number of GPUs per node for rollout server.
+n_gpus_per_node: ${oc.select:trainer.n_gpus_per_node,8}
+
+# typically the same as data max prompt length
+# same as data.max_prompt_length if it exists
+prompt_length: ${oc.select:data.max_prompt_length,512}
+
+# Final prompt-embedding sequence length after combining all text encoders.
+# null falls back to pipeline.max_sequence_length for single-encoder models.
+max_prompt_embed_length: null
+
+# for vllm-omni rollout
+# Rollout model parameters type. Align with actor model's FSDP/Megatron type.
+dtype: bfloat16
+
+# vLLM-omni diffusion attention backend.  Must be consistent with
+# ``actor_rollout_ref.model.attn_backend`` (validated at startup).
+# Available options: ["FLASH_ATTN", "FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB", "TORCH_SDPA"]
+# Default FLASH_ATTN_3_HUB pairs with actor attn_backend=_flash_3_varlen_hub for
+# kernels FA3 train/rollout consistency. Use FLASH_ATTN for the legacy local FA path.
+rollout_attn_backend: FLASH_ATTN_3_HUB
+
+# Fraction of GPU memory used by vLLM-Omni for cache.
+gpu_memory_utilization: 0.5
+
+# Whether to disable CUDA graph. Default False to best performance.
+enforce_eager: False
+
+# batch size of cudagraph to capture. Require enforce_eager: False to use this option
+# Since cudagraph in inference engine can not be offloaded during update policy,
+# you can use smaller batch size to save memory used in cuda graph, eg: [1 ,2, 4, 8, 16, 32]
+# supported engines: vllm
+cudagraph_capture_sizes: null
+
+# Whether to free engine cache after generation.
+free_cache_engine: True
+
+# TP size for rollout
+tensor_model_parallel_size: 2
+
+# Ulysses sequence parallelism; multiplies the replica GPU footprint.
+ulysses_degree: 1
+
+# Ring sequence parallelism; multiplies the replica GPU footprint.
+ring_degree: 1
+
+# Text-encoder TP: 1 or the full TP * Ulysses * Ring DiT group.
+text_encoder_tp_size: 1
+
+# VAE patch parallelism reuses the DiT group.
+vae_patch_parallel_size: 1
+
+# VAE decode parallel mode; supported modes depend on the pipeline.
+vae_parallel_mode: tile
+
+# Enable tiled VAE execution.
+vae_use_tiling: false
+
+# DP size for rollout
+data_parallel_size: 1
+
+# EP size for rollout
+expert_parallel_size: 1
+
+# PP size for rollout
+pipeline_model_parallel_size: 1
+
+# max number of tokens in a batch
+max_num_batched_tokens: 8192
+
+# max length for rollout
+max_model_len: null
+
+# max length of sequences
+max_num_seqs: 1024
+
+# When True, the vLLM-Omni engine runs the registered pipeline in
+# step-execution mode.
+step_execution: False
+
+# may get higher throughput when set to True. When activated, Please increase max_num_batched_tokens or decrease max_model_len.
+enable_chunked_prefill: True
+
+# Prefix caching kv-cache blocks is a popular optimization in LLM inference to avoid redundant prompt computations.
+enable_prefix_caching: False
+
+# logprobs mode for rollout logprobs
+logprobs_mode: processed_logprobs
+
+# scheduling policy for vllm-omni rollout
+scheduling_policy: fcfs
+
+# Which loader to use for rollout model weights: dummy, hf, megatron, etc.
+# safetensors (for huge model, and set use_shm=True); dummy: randomly init model weight
+load_format: dummy
+
+# for huge model, layered summon can save memory (prevent OOM) but make it slower
+layered_summon: False
+
+# The batch size for one forward pass in the computation of log_prob. Local batch size per GPU.
+log_prob_micro_batch_size_per_gpu: null
+
+# disable logging statistics
+disable_log_stats: True
+
+# number of responses (i.e. num sample times). > 1 for grpo
+n: 1
+
+# Optional stage 2: number of diffusion responses (i.e. num sample times). > 1 for grpo
+m: 1
+
+# Base seed for deterministic training rollout RNG.
+# Per-step base is ``seed + global_step - 1``. null disables rollout seeding.
+seed: 42
+
+# Whether to enable full determinism for reproducibility.
+full_determinism: False
+
+# Multi-turn interaction config for tools or chat.
+multi_turn:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.MultiTurnConfig
+
+  # set to True for multi-turn tool interaction tasks;
+  enable: False
+
+# Extra inference engine arguments (vllm-omni), please refer vllm/sglang/trtllm official doc for detail
+engine_kwargs:
+
+  # vllm-omni engine config
+  vllm_omni: {}
+
+# Reuse text-encoder outputs for repeated diffusion prompts.
+enable_prompt_embed_cache: false
+
+# Maximum number of prompt embeddings cached per diffusion worker.
+prompt_embed_cache_size: 32
+
+# Route repeated rollouts for one sample to the same worker when prompt cache is enabled.
+enable_prompt_embed_cache_routing_affinity: false
+
+# Sampling parameters used during validation (diffusion-specific).
+val_kwargs:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl_omni.workers.config.diffusion.DiffusionSamplingConfig
+
+  # whether to repeat n times for validation
+  n: 1
+
+  # AR stage: number of samples per prompt during validation (composite rollouts)
+  m: 1
+
+  # Pipeline configuration for validation
+  pipeline:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl_omni.workers.config.diffusion.DiffusionPipelineConfig
+
+    # image height for diffusion model validation
+    height: ${oc.select:actor_rollout_ref.rollout.pipeline.height,512}
+
+    # image width for diffusion model validation
+    width: ${oc.select:actor_rollout_ref.rollout.pipeline.width,512}
+
+    # number of inference steps for diffusion model validation
+    num_inference_steps: 50
+
+    # Additional named artifacts required during validation
+    requested_outputs: ${oc.select:actor_rollout_ref.rollout.pipeline.requested_outputs,null}
+
+    # Classifier-free guidance scale (true CFG); values > 1.0 enable CFG with negative prompt
+    true_cfg_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.true_cfg_scale,1.0}
+
+    # Maximum text-encoder token sequence length for prompt encoding
+    max_sequence_length: ${oc.select:actor_rollout_ref.rollout.pipeline.max_sequence_length,512}
+
+    # Distilled guidance scale for models with guidance_embeds; null to disable
+    guidance_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.guidance_scale,null}
+
+    # Reference-image short edge for compatible pipelines (validation)
+    reference_image_short_edge: ${oc.select:actor_rollout_ref.rollout.pipeline.reference_image_short_edge,null}
+
+    # Wan2.2 number of frames (validation)
+    num_frames: ${oc.select:actor_rollout_ref.rollout.pipeline.num_frames,1}
+
+    # Audio-video frame rate (validation)
+    frame_rate: ${oc.select:actor_rollout_ref.rollout.pipeline.frame_rate,24.0}
+
+    # Flow-matching sigma-schedule shift for the video stream (validation)
+    video_flow_shift: ${oc.select:actor_rollout_ref.rollout.pipeline.video_flow_shift,12.0}
+
+    # Task label forwarded to the vLLM-Omni request `task`, pipeline-specific (validation)
+    task: ${oc.select:actor_rollout_ref.rollout.pipeline.task,null}
+
+    # Optional frame indices for pipelines that accept them (validation)
+    frame_indices: ${oc.select:actor_rollout_ref.rollout.pipeline.frame_indices,null}
+
+    # Named canvas aspect ratio for compatible pipelines (validation)
+    aspect_ratio: ${oc.select:actor_rollout_ref.rollout.pipeline.aspect_ratio,null}
+
+  # Rollout Algorithm configuration for validation
+  algo:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl_omni.workers.config.diffusion.DiffusionRolloutAlgoConfig
+
+    # Magnitude of SDE noise injected inside the active window during validation
+    noise_level: 0.0
+
+    # SDE variant: "sde" or "cps"
+    sde_type: ${oc.select:actor_rollout_ref.rollout.algo.sde_type,sde}
+
+    # Number of denoising steps selected from sde_window_range; null = all steps
+    sde_window_size: ${oc.select:actor_rollout_ref.rollout.algo.sde_window_size,null}
+
+    # [start, end) range of eligible denoising steps; null = entire trajectory
+    sde_window_range: ${oc.select:actor_rollout_ref.rollout.algo.sde_window_range,null}
+
+    # Whether selected SDE steps must form one consecutive window
+    sde_contiguous: ${oc.select:actor_rollout_ref.rollout.algo.sde_contiguous,true}
+
+  # Optional. AR part rollout configuration for validation
+  ar:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl_omni.workers.config.diffusion.DiffusionARConfig
+
+    # Sampling temperature for rollout.
+    temperature: ${oc.select:actor_rollout_ref.rollout.ar.temperature,1.0}
+
+    # Top-k sampling parameter. 0 for HF rollout.
+    top_k: ${oc.select:actor_rollout_ref.rollout.ar.top_k,0}
+
+    # Top-p sampling parameter. Default 1.0.
+    top_p: ${oc.select:actor_rollout_ref.rollout.ar.top_p,1.0}
+
+    # Repetition penalty parameter. Default to 1.0 (no panelty)
+    repetition_penalty: ${oc.select:actor_rollout_ref.rollout.ar.repetition_penalty,1.0}
+
+    # Max number of newly generated tokens for validation
+    response_length: ${oc.select:actor_rollout_ref.rollout.ar.response_length,1024}
+
+# Rollout Algorithm configuration
+algo:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl_omni.workers.config.diffusion.DiffusionRolloutAlgoConfig
+
+  # Magnitude of SDE noise injected inside the active window
+  noise_level: 1.0
+
+  # SDE variant: "sde" or "cps"
+  sde_type: sde
+
+  # Number of denoising steps selected from sde_window_range; null = all steps
+  sde_window_size: null
+
+  # [start, end) range of eligible denoising steps; null = entire trajectory
+  sde_window_range: null
+
+  # Whether selected SDE steps must form one consecutive window
+  sde_contiguous: true
+
+  # MixGRPO sliding-window scheduler configs
+
+  # Sliding strategy: "random" (default) draws a fresh window per step;
+  # "progressive" advances by sde_window_size every iters_per_group iterations.
+  sample_strategy: random
+
+  # Number of training iterations spent at each window position (progressive only).
+  iters_per_group: 1
+
+  # Base seed for the random window draws (random only)
+  sde_window_seed: 0
+
+# Pipeline configuration for diffusion model generation
+pipeline:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl_omni.workers.config.diffusion.DiffusionPipelineConfig
+
+  # image height for diffusion model rollout
+  height: 512
+
+  # image width for diffusion model rollout
+  width: 512
+
+  # number of inference steps for diffusion model rollout
+  num_inference_steps: 10
+
+  # Additional named artifacts required by rewards/logging (for example a decoded preview with latent primary)
+  requested_outputs: null
+
+  # Classifier-free guidance scale (true CFG); values > 1.0 enable CFG with negative prompt
+  true_cfg_scale: 1.0
+
+  # Maximum text-encoder token sequence length for prompt encoding
+  max_sequence_length: 512
+
+  # Distilled guidance scale for models with guidance_embeds; null to disable
+  guidance_scale: null
+
+  # Reference-image short edge for compatible pipelines
+  reference_image_short_edge: null
+
+  # Wan2.2 number of frames
+  num_frames: 1
+
+  # Audio-video frame rate
+  frame_rate: 24.0
+
+  # Flow-matching sigma-schedule shift for the video stream
+  video_flow_shift: 12.0
+
+  # Task label forwarded to the vLLM-Omni request `task`, pipeline-specific
+  task: null
+
+  # Optional frame indices for pipelines that accept them
+  frame_indices: null
+
+  # Named canvas aspect ratio for compatible pipelines
+  aspect_ratio: null
+
+# Optional. AR part rollout use.
+ar:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl_omni.workers.config.diffusion.DiffusionARConfig
+
+  # Sampling temperature for rollout.
+  temperature: 1.0
+
+  # Top-k sampling parameter. 0 for HF rollout.
+  top_k: 0
+
+  # Top-p sampling parameter. Default 1.0.
+  top_p: 1.0
+
+  # Repetition penalty parameter. Default to 1.0 (no panelty)
+  repetition_penalty: 1.0
+
+  # Max number of newly generated tokens
+  response_length: 1024
+
+# support logging rollout prob for debugging purpose
+calculate_log_probs: False
+
+# Support token-level log prob return in rollout
+ar_calculate_log_probs: False
+
+# Named adapter used by rollout generation
+rollout_adapter: default
+
+# [Experimental] agent loop based rollout configs
+agent:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.AgentLoopConfig
+
+  # Number of agent loop workers
+  num_workers: 8
+
+  # default agent loop to use if `agent_name` not set in RL dataset
+  default_agent_loop: diffusion_single_turn_agent
+
+# Checkpoint Engine config for update weights from trainer to rollout
+checkpoint_engine:
+
+  # Target class for checkpoint engine config
+  _target_: verl.workers.config.CheckpointEngineConfig
+
+  # Backend for checkpoint engine: naive, nccl, nixl, hccl, omni_delta_sharded.
+  # omni_delta_sharded broadcasts only the weights that changed since the last
+  # sync; full-weight v1 separate_async runs only (see docs/start/diffusion_v1.md).
+  backend: naive
+
+  # Specifies the tensor bucket size (in megabytes) for batch weight updates during rollout operations.
+  # This parameter controls the maximum payload size for a single weight update request.
+  # Reference: https://github.com/volcengine/verl/pull/2418
+  # Currently only supported in SGLang rollout implementations
+  # Larger values may improve throughput but increase memory overhead
+  # Detailed performance comparison:
+  # https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/issues/169#issuecomment-3070686720
+  # Default value (512MB) is optimized for typical GPU memory configurations
+  # For the best performance of `rebuild_cuda_tensor`, it is recommended to:
+  # 1. Enable `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES`
+  # 2. Manually set `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7`
+  # when using Tensor Parallelism (TP) >= 8.
+  update_weights_bucket_megabytes: 2048
+
+  # Additional keyword arguments to pass to the checkpoint engine constructor
+  engine_kwargs: {}
+
+  # If set, this Python module is imported on every worker process before the
+  # backend is instantiated, allowing custom backends to register themselves
+  # in CheckpointEngineRegistry.
+  custom_backend_module: null
+
+# Whether to skip tokenizer initialization for rollout engine
+# When enabled (True), the rollout assume token in token out for generation
+skip_tokenizer_init: True
+
+# Whether to enable rollout routing replay for MoE models
+# When enabled (True), the rollout will record the routing decisions.
+enable_rollout_routing_replay: False
+
+# prometheus configuration for vllm-omni server mode
+prometheus:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.PrometheusConfig
+
+  # Whether to enable prometheus metrics
+  enable: false
+
+# type of quantization in vllm-omni
+quantization: null
+
+# MTP configuration, reuse model configuration
+mtp: ${oc.select:actor_rollout_ref.model.mtp, null}
+
+# external libs for rollout-side extensions (e.g., rollout pipeline registrations such as vllm-omni)
+external_lib: null
+
+# Prefill-Decode disaggregation config (SGLang only). Disabled by default.
+disaggregation:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.DisaggregationConfig
+
+  # Whether to enable PD disaggregation
+  enabled: False

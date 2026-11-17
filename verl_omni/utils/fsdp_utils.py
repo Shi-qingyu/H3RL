@@ -1,0 +1,653 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+FSDP utilities for verl-omni
+"""
+
+import json
+import logging
+from collections import OrderedDict
+from collections.abc import Sequence
+from contextlib import ExitStack, contextmanager
+from functools import partial
+from pathlib import Path
+
+import peft
+import torch
+from peft.utils.save_and_load import get_peft_model_state_dict
+from safetensors.torch import save_file
+from verl.utils.fsdp_utils import collect_lora_params as _upstream_collect_lora_params
+from verl.utils.fsdp_utils import fsdp_version
+from verl.utils.fsdp_utils import layered_summon_lora_params as _upstream_layered_summon_lora_params
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "apply_fsdp2",
+    "collect_lora_params",
+    "export_fsdp_lora_adapter",
+    "fsdp_summon_full_params",
+    "split_fused_moe_lora_targets",
+]
+
+# Fused MoE experts (e.g. Qwen3OmniMoeThinkerTextExperts) are nn.Module + 3D
+# nn.Parameter, not nn.Linear. PEFT must target them via target_parameters.
+_FUSED_MOE_EXPERTS_MODULE = "experts"
+_FUSED_MOE_DEFAULT_TARGET_PARAMETERS = ("gate_up_proj", "down_proj")
+
+
+def _get_fsdp_module_cls():
+    try:
+        from torch.distributed.fsdp import FSDPModule
+    except ImportError:
+        from torch.distributed._composable.fsdp import FSDPModule
+    return FSDPModule
+
+
+def _iter_fsdp2_submodules(module):
+    fsdp_module_cls = _get_fsdp_module_cls()
+    for name, submodule in module.named_modules():
+        if isinstance(submodule, fsdp_module_cls) and name != "":
+            yield name, submodule
+
+
+def _filter_ignored_wrap_targets(wrap_targets, root, ignored_names):
+    """Drop wrap targets nested under ignored subtrees."""
+    if not ignored_names:
+        return wrap_targets
+    names_by_id = {id(submodule): name for name, submodule in root.named_modules()}
+    kept = []
+    for target in wrap_targets:
+        name = names_by_id.get(id(target))
+        if name is not None and any(part in ignored_names for part in name.split(".")):
+            logger.debug("Skipping FSDP2 wrap target %s: inside an ignored subtree.", name)
+            continue
+        kept.append(target)
+    return kept
+
+
+def apply_fsdp2(model, fsdp_kwargs, config, ignored_names: Sequence[str] = ()):
+    """FSDP2 wrap; ``ignored_names`` subtrees stay unsharded.
+
+    Adapted from verl's ``apply_fsdp2``; deltas are DIFF-marked.
+    """
+    from torch.distributed.fsdp import FSDPModule, fully_shard
+    from verl.utils.device import get_device_name
+    from verl.utils.fsdp_utils import (
+        CPUOffloadPolicy,
+        _select_fsdp2_wrap_targets,
+        maybe_patch_fsdp_module,
+    )
+
+    assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
+
+    # DIFF vs upstream: fail on trainable ignored params — FSDP2 never syncs their gradients
+    ignored_params = set()
+    trainable_ignored: list[str] = []
+    for name, param in model.named_parameters():
+        if any(part in ignored_names for part in name.split(".")):
+            ignored_params.add(param)
+            if param.requires_grad:
+                trainable_ignored.append(name)
+    mesh = fsdp_kwargs.get("mesh")
+    if trainable_ignored and (mesh is None or mesh.size() > 1):
+        raise ValueError(
+            "FSDP2-ignored parameters must be frozen, but these require "
+            f"gradients: {trainable_ignored}. Either remove them from ignored_names or exclude "
+            "them from training (LoRA target/exclude modules) — ignored params get no gradient "
+            "synchronization."
+        )
+
+    default_transformer_cls_names_to_wrap = getattr(model, "_no_split_modules", None)
+    fsdp_transformer_layer_cls_to_wrap = config.get("wrap_policy", {}).get(
+        "transformer_layer_cls_to_wrap", default_transformer_cls_names_to_wrap
+    )
+
+    if isinstance(fsdp_transformer_layer_cls_to_wrap, str):
+        fsdp_transformer_layer_cls_to_wrap = [fsdp_transformer_layer_cls_to_wrap]
+
+    if isinstance(fsdp_transformer_layer_cls_to_wrap, set):
+        fsdp_transformer_layer_cls_to_wrap = list(fsdp_transformer_layer_cls_to_wrap)
+    assert len(fsdp_transformer_layer_cls_to_wrap) > 0 and fsdp_transformer_layer_cls_to_wrap[0] is not None
+
+    # DIFF vs upstream: skip blanket wrap targets nested in ignored subtrees
+    modules = _filter_ignored_wrap_targets(
+        _select_fsdp2_wrap_targets(model, fsdp_transformer_layer_cls_to_wrap), model, ignored_names
+    )
+
+    for idx, module in enumerate(modules):
+        with maybe_patch_fsdp_module(module):
+            fully_shard(module, **fsdp_kwargs)
+
+    with maybe_patch_fsdp_module(model):
+        # DIFF vs upstream: only the root call carries ignored_params
+        # fsdp2 will not reshard_after_forward for root module
+        fully_shard(model, ignored_params=ignored_params, **fsdp_kwargs)
+
+    # oneCCL (xccl) can abort on the ReduceOp.AVG that FSDP2 uses for fp32/bf16 gradient
+    # reduce-scatter; reduce with SUM and divide instead, as verl-hardware-plugin does for
+    # verl's own XPU engines.
+    if get_device_name() == "xpu":
+        for m in model.modules():
+            if isinstance(m, FSDPModule):
+                m.set_force_sum_reduction_for_comms(True)
+
+    # Honor `forward_prefetch` config to match the FSDP1 path. Depth=1 mirrors
+    # PyTorch FSDP1's hardcoded `forward_prefetch_limit=1`. Static-graph models
+    # only (see PyTorch FSDP1's docstring on `forward_prefetch`).
+    # `set_modules_to_forward_prefetch` was introduced in PyTorch 2.5; guard with
+    # `hasattr` so users on PyTorch 2.4 silently fall back to the no-prefetch
+    # behavior (same as before this PR — no regression).
+    if config.get("forward_prefetch", False):
+        fsdp_modules = [m for m in modules if isinstance(m, FSDPModule)]
+        for i, m in enumerate(fsdp_modules):
+            next_targets = fsdp_modules[i + 1 : i + 2]  # depth=1, mirrors FSDP1's forward_prefetch_limit=1
+            if next_targets and hasattr(m, "set_modules_to_forward_prefetch"):
+                m.set_modules_to_forward_prefetch(next_targets)
+
+
+@contextmanager
+def fsdp_summon_full_params(module, *, writeback: bool = False, with_grads: bool = False, recurse: bool = True):
+    """Summon unsharded params for FSDP1/FSDP2, matching verl's fsdp_merge_unmerge pattern."""
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    version = fsdp_version(module)
+    if version == 0:
+        yield
+        return
+    if version == 1:
+        with FSDP.summon_full_params(module, writeback=writeback, recurse=recurse, with_grads=with_grads):
+            yield
+        return
+
+    submodules = list(_iter_fsdp2_submodules(module))
+    if not submodules:
+        yield
+        return
+
+    with ExitStack() as stack:
+        for _, submodule in submodules:
+            stack.enter_context(FSDP.summon_full_params(submodule, writeback=writeback, with_grads=with_grads))
+        yield
+
+
+def _param_to_cpu(param):
+    if hasattr(param, "full_tensor"):
+        return param.full_tensor().detach().cpu()
+    return param.detach().cpu()
+
+
+def _load_json(path: Path) -> dict:
+    with path.open(encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _to_peft_lora_key(key: str, adapter_name: str = "default") -> str:
+    """Normalize an FSDP LoRA tensor name to PEFT ``adapter_model.safetensors`` format."""
+    peft_key = _lora_checkpoint_key(key, adapter_name)
+    if peft_key.startswith("base_model.model."):
+        return peft_key
+    return f"base_model.model.{peft_key}"
+
+
+def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if hasattr(tensor, "_local_tensor"):
+        tensor = tensor._local_tensor
+    return tensor.detach().cpu().contiguous()
+
+
+def _normalize_peft_config(config: dict) -> dict:
+    for key in ("task_type", "peft_type"):
+        if key in config and hasattr(config[key], "value"):
+            config[key] = config[key].value
+    if config.get("target_modules") is not None:
+        config["target_modules"] = sorted(config["target_modules"])
+    if config.get("target_parameters") is not None:
+        config["target_parameters"] = sorted(config["target_parameters"])
+    return config
+
+
+def split_fused_moe_lora_targets(
+    target_modules: Sequence[str] | set[str] | str | None,
+    target_parameters: Sequence[str] | None = None,
+) -> tuple[list[str], list[str] | None]:
+    """Move fused MoE ``experts`` module names onto ``target_parameters``.
+
+    ``export_fsdp_lora_adapter`` infers ``target_modules`` from the last path
+    segment of LoRA keys. Fused-expert ParamWrapper keys look like
+    ``...mlp.experts.lora_A.weight``, so the inferred name is ``experts``.
+    PEFT cannot wrap ``Qwen3OmniMoeThinkerTextExperts`` as ``nn.Linear``; those
+    adapters must use ``target_parameters=['gate_up_proj', 'down_proj']``.
+    """
+    if target_modules is None:
+        modules: list[str] = []
+    elif isinstance(target_modules, str):
+        modules = [target_modules]
+    else:
+        modules = list(target_modules)
+
+    params = [] if target_parameters is None else list(target_parameters)
+    if _FUSED_MOE_EXPERTS_MODULE not in modules:
+        return sorted(modules), (sorted(params) if params else None)
+
+    modules = [name for name in modules if name != _FUSED_MOE_EXPERTS_MODULE]
+    if not params:
+        params = list(_FUSED_MOE_DEFAULT_TARGET_PARAMETERS)
+    return sorted(modules), sorted(params)
+
+
+def _discover_fsdp_rank_paths(input_dir: Path, world_size: int) -> list[Path]:
+    rank_paths = [input_dir / f"model_world_size_{world_size}_rank_{rank}.pt" for rank in range(world_size)]
+    missing = [str(path) for path in rank_paths if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"Missing rank checkpoint(s): {missing}")
+    return rank_paths
+
+
+def _merge_fsdp_lora_tensors(
+    rank_paths: list[Path], adapter_name: str = "default"
+) -> tuple[OrderedDict[str, torch.Tensor], list[str]]:
+    from verl_omni.model_merger.fsdp_model_merger import reconstruct_tensor
+
+    print(f"Loading rank 0/{len(rank_paths) - 1}: {rank_paths[0].name}")
+    rank0_state = torch.load(rank_paths[0], map_location="cpu", weights_only=False, mmap=True)
+    lora_keys = sorted(key for key in rank0_state if _lora_checkpoint_key(key, adapter_name) is not None)
+    if not lora_keys:
+        raise ValueError(f"No LoRA weights for adapter {adapter_name!r} in {rank_paths[0]}")
+
+    print(f"Found {len(lora_keys)} LoRA tensors")
+    lora_shards = {key: [rank0_state[key]] for key in lora_keys}
+    del rank0_state
+
+    for rank, rank_path in enumerate(rank_paths[1:], start=1):
+        print(f"Loading rank {rank}/{len(rank_paths) - 1}: {rank_path.name}")
+        rank_state = torch.load(rank_path, map_location="cpu", weights_only=False, mmap=True)
+        for key in lora_keys:
+            lora_shards[key].append(rank_state[key])
+        del rank_state
+
+    lora_params = OrderedDict()
+    target_modules = set()
+    for key in lora_keys:
+        shards = lora_shards.pop(key)
+        merged = reconstruct_tensor(shards, tuple(shards[0].shape))
+
+        peft_key = _to_peft_lora_key(key, adapter_name)
+        module_key = peft_key.rsplit(".lora_", maxsplit=1)[0]
+        target_parts = [part for part in module_key.split(".") if part != "base_layer"]
+        target_module = ".".join(target_parts[-2:]) if target_parts[-1].isdigit() else target_parts[-1]
+        lora_params[peft_key] = merged
+        target_modules.add(target_module)
+
+    return lora_params, sorted(target_modules)
+
+
+def _build_peft_lora_config(meta: dict, target_modules: list[str], base_model_name_or_path: str | None) -> dict:
+    modules, params = split_fused_moe_lora_targets(target_modules, meta.get("target_parameters"))
+    peft_dict = {
+        "r": int(meta["r"]),
+        "lora_alpha": int(meta["lora_alpha"]),
+        "target_modules": modules,
+    }
+    if params:
+        peft_dict["target_parameters"] = params
+    if meta.get("task_type") is not None:
+        peft_dict["task_type"] = meta["task_type"]
+
+    config = peft.LoraConfig(**peft_dict).to_dict()
+    config = _normalize_peft_config(config)
+    if base_model_name_or_path is not None:
+        config["base_model_name_or_path"] = base_model_name_or_path
+    return config
+
+
+def export_fsdp_lora_adapter(
+    input_dir: str | Path,
+    output_dir: str | Path | None = None,
+    base_model_name_or_path: str | None = None,
+    *,
+    adapter_name: str = "default",
+) -> dict:
+    """Export PEFT LoRA adapter weights from a verl FSDP checkpoint directory.
+
+    This helper is intended for FSDP checkpoints that contain LoRA weights
+    inside sharded model state dicts. It reads only tensors whose names contain
+    ``lora_``, merges their DTensor/local shards across ranks, and writes a
+    PEFT-compatible ``adapter_config.json`` plus ``adapter_model.safetensors``.
+    The full model is not instantiated.
+
+    Args:
+        input_dir: Directory containing ``fsdp_config.json``,
+            ``lora_train_meta.json``, and
+            ``model_world_size_<world_size>_rank_<rank>.pt`` files.
+        output_dir: Directory to write the PEFT adapter files. Defaults to
+            ``<input_dir>/lora_adapter``.
+        base_model_name_or_path: Optional value to write into the PEFT
+            ``adapter_config.json`` as ``base_model_name_or_path``.
+        adapter_name: Registered adapter selected from the checkpoint.
+
+    Returns:
+        A summary dictionary with:
+        ``output_dir`` (str), ``target_modules`` (list[str]),
+        ``target_parameters`` (list[str] | None), ``adapter_tensors`` (int),
+        ``adapter_size_mib`` (float), and ``world_size`` (int).
+    """
+    input_dir = Path(input_dir).expanduser().resolve()
+    output_dir = Path(output_dir).expanduser().resolve() if output_dir is not None else input_dir / "lora_adapter"
+
+    fsdp_config = _load_json(input_dir / "fsdp_config.json")
+    lora_meta = _load_json(input_dir / "lora_train_meta.json")
+    world_size = int(fsdp_config["world_size"])
+    rank_paths = _discover_fsdp_rank_paths(input_dir, world_size)
+
+    print(f"Exporting LoRA adapter from {world_size} FSDP ranks")
+    print(f"Input directory: {input_dir}")
+    print(f"Output: {output_dir}")
+
+    lora_params, target_modules = _merge_fsdp_lora_tensors(rank_paths, adapter_name)
+    peft_config = _build_peft_lora_config(lora_meta, target_modules, base_model_name_or_path)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / "adapter_config.json").open("w", encoding="utf-8") as f:
+        json.dump(peft_config, f, ensure_ascii=False, indent=4)
+    save_file(lora_params, output_dir / "adapter_model.safetensors")
+
+    adapter_size = (output_dir / "adapter_model.safetensors").stat().st_size / (1024**2)
+    return {
+        "output_dir": str(output_dir),
+        "target_modules": peft_config.get("target_modules"),
+        "target_parameters": peft_config.get("target_parameters"),
+        "adapter_tensors": len(lora_params),
+        "adapter_size_mib": adapter_size,
+        "world_size": world_size,
+    }
+
+
+def _peft_lora_params_to_cpu(peft_model, adapter_name: str) -> OrderedDict:
+    # Nested FSDP leaf wrap: ``state_dict()`` can hit non-root FSDP hooks.
+    # ``named_parameters()`` is the mapping verl's layered walker already uses.
+    state_dict = {name: param for name, param in peft_model.named_parameters()}
+    lora_params = get_peft_model_state_dict(peft_model, state_dict=state_dict, adapter_name=adapter_name)
+    return OrderedDict((name, _param_to_cpu(param)) for name, param in lora_params.items())
+
+
+def _collect_base_weights_to_cpu(peft_model) -> OrderedDict:
+    from verl.utils.device import get_device_name
+
+    model = peft_model.base_model.model
+    orig_dev = "cpu" if "cpu" in str(next(model.parameters()).device) else get_device_name()
+    model = model.to("cpu")
+    lora_params = OrderedDict()
+    for name, param in model.state_dict().items():
+        if any(x in name for x in ["_flat_param", "lora_"]):
+            continue
+        name = name.replace("_fsdp_wrapped_module.", "").replace(".base_layer", "")
+        lora_params[name] = _param_to_cpu(param)
+    model = model.to(orig_dev)
+    return lora_params
+
+
+def _collect_base_weights_from_state_dict(state_dict) -> OrderedDict:
+    lora_params = OrderedDict()
+    for name, param in state_dict.items():
+        if any(x in name for x in ["_flat_param", "lora_"]):
+            continue
+        name = name.replace("_fsdp_wrapped_module.", "").replace(".base_layer", "")
+        lora_params[name] = _param_to_cpu(param)
+    return lora_params
+
+
+def _collect_lora_params_non_layered(module, peft_model, adapter_name: str, base_sync_done: bool) -> OrderedDict:
+    """Collect LoRA/base params without layered summon for FSDP1/FSDP2/non-FSDP modules."""
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from verl.utils.device import get_torch_device
+
+    version = fsdp_version(module)
+    if version == 0:
+        if base_sync_done:
+            return _peft_lora_params_to_cpu(peft_model, adapter_name)
+        return _collect_base_weights_to_cpu(peft_model)
+
+    if version == 1:
+        with FSDP.summon_full_params(module, writeback=False):
+            if base_sync_done:
+                lora_params = _peft_or_named_lora(peft_model, adapter_name)
+            else:
+                lora_params = _collect_base_weights_to_cpu(peft_model)
+        get_torch_device().empty_cache()
+        return lora_params
+
+    # FSDP2 DTensor params all-gather via full_tensor() (same as verl). Do not
+    # pass a child unit's short-key state_dict into get_peft_model_state_dict:
+    # PEFT matches full-model tuner prefixes and returns {}.
+    if base_sync_done:
+        return _peft_or_named_lora(peft_model, adapter_name)
+
+    lora_params = OrderedDict()
+    for name, submodule in _iter_fsdp2_submodules(module):
+        with FSDP.summon_full_params(submodule, writeback=False):
+            block_prefix = name.replace("_fsdp_wrapped_module.", "")
+            sub_base_params = _collect_base_weights_from_state_dict(submodule.state_dict())
+            for param_name, param in sub_base_params.items():
+                full_name = f"{block_prefix}.{param_name}" if block_prefix else param_name
+                lora_params[full_name] = param
+    get_torch_device().empty_cache()
+    return lora_params
+
+
+def _layered_summon_lora_params_diffusers(
+    fsdp_module, adapter_name: str = "default", layer_prefixes: Sequence[str] = ("transformer_blocks.",)
+) -> OrderedDict:
+    """Layered LoRA param collection for diffusers transformer-block models.
+
+    Args:
+        fsdp_module: The FSDP-wrapped module.
+        adapter_name: LoRA adapter name.
+        layer_prefixes: FSDP layer name prefixes.  Defaults to
+            ``["transformer_blocks."]``.
+    """
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from verl.utils.device import get_torch_device
+
+    def _prefix_submodules(module, prefix):
+        for name, submodule in module.named_modules():
+            if name.startswith(prefix) and "." not in name[len(prefix) :]:
+                yield name, submodule
+
+    lora_params = OrderedDict()
+    prefix_list = []
+    for lp in layer_prefixes:
+        # FSDP1
+        prefix_list.append(f"_fsdp_wrapped_module.{lp}")
+        # FSDP2
+        prefix_list.append(lp)
+    peft_model = getattr(fsdp_module, "_fsdp_wrapped_module", fsdp_module)
+    for prefix in prefix_list:
+        for name, submodule in _prefix_submodules(fsdp_module, prefix):
+            block_prefix = name.replace("_fsdp_wrapped_module.", "")
+            if name.endswith(".model") or name.endswith(".layers"):
+                continue
+            if fsdp_version(submodule) > 0:
+                with FSDP.summon_full_params(submodule, writeback=False):
+                    # PEFT filters against root-model paths, while a nested FSDP
+                    # unit's state dict contains only block-local paths.
+                    state_prefix = block_prefix
+                    if fsdp_version(submodule) == 1:
+                        state_prefix = f"{state_prefix}._fsdp_wrapped_module"
+                    state_dict = {
+                        f"{state_prefix}.{param_name}": param for param_name, param in submodule.state_dict().items()
+                    }
+                    sub_lora_params = get_peft_model_state_dict(
+                        peft_model, state_dict=state_dict, adapter_name=adapter_name
+                    )
+                    if not sub_lora_params:
+                        sub_lora_params = _lora_params_by_name(submodule, adapter_name)
+                    sub_lora_params = {
+                        param_name.replace("_fsdp_wrapped_module.", ""): _param_to_cpu(param)
+                        for param_name, param in sub_lora_params.items()
+                    }
+                    lora_params.update(sub_lora_params)
+                    submodule._is_root = False
+                get_torch_device().empty_cache()
+    return lora_params
+
+
+def _lora_checkpoint_key(name: str, adapter_name: str) -> str | None:
+    """PEFT checkpoint key: ``lora_A.default.weight`` -> ``lora_A.weight``. None if another adapter."""
+    name = name.replace("_fsdp_wrapped_module.", "")
+    if "lora_" not in name or "_flat_param" in name:
+        return None
+    parts = name.split(".")
+    lora_i = next((i for i, part in enumerate(parts) if part.startswith("lora_")), None)
+    if lora_i is None:
+        return None
+    rest = parts[lora_i + 1 :]
+    if rest and rest[0] not in ("weight", "bias", adapter_name):
+        return None
+    if rest and rest[0] == adapter_name:
+        return ".".join(parts[: lora_i + 1] + rest[1:])
+    return name
+
+
+def _clean_lora_param_names(params: OrderedDict, adapter_name: str) -> OrderedDict:
+    """Drop FSDP/PEFT wrapper tokens so vLLM's LoRA name parser can load the tensors.
+
+    Nested FSDP leaf wraps leave ``_fsdp_wrapped_module`` inside
+    ``state_dict()`` keys (e.g. ``transformer_blocks.0._fsdp_wrapped_module.attn.to_q.
+    lora_A.default._fsdp_wrapped_module.weight``). A non-empty dump of those keys
+    skips the ``_lora_params_by_name`` fallback, and vLLM then raises
+    ``unsupported LoRA weight``.
+    """
+    cleaned = OrderedDict()
+    for name, tensor in params.items():
+        key = _lora_checkpoint_key(name, adapter_name)
+        cleaned[key if key is not None else name.replace("_fsdp_wrapped_module.", "")] = tensor
+    return cleaned
+
+
+def _lora_params_by_name(module, adapter_name: str) -> OrderedDict:
+    """Selected-adapter LoRA tensors from ``named_parameters`` when PEFT prefix matching misses."""
+    params = OrderedDict()
+    for name, param in module.named_parameters():
+        key = _lora_checkpoint_key(name, adapter_name)
+        if key is not None:
+            params[key] = _param_to_cpu(param)
+    return params
+
+
+def _peft_or_named_lora(peft_model, adapter_name: str) -> OrderedDict:
+    return _peft_lora_params_to_cpu(peft_model, adapter_name) or _lora_params_by_name(peft_model, adapter_name)
+
+
+def collect_lora_params(
+    module,
+    layered_summon: bool,
+    base_sync_done: bool,
+    is_diffusers: bool = False,
+    adapter_name: str = "default",
+    layer_prefixes: Sequence[str] = ("transformer_blocks.",),
+) -> OrderedDict:
+    """Collect LoRA or base parameters for weight sync to the rollout worker.
+
+    Raises ``RuntimeError`` when no parameters were collected
+    (e.g. mismatched ``layer_prefixes``).
+
+    Args:
+        module: The FSDP-wrapped or plain module.
+        layered_summon: Summon one FSDP unit at a time instead of the full model.
+        base_sync_done: If ``True``, collect only LoRA weights; else full base weights.
+        is_diffusers: Use the diffusers-specific layered summon helper.
+        adapter_name: LoRA adapter name (usually ``"default"``).
+        layer_prefixes: FSDP layer name prefixes (``["transformer_blocks."]``
+    """
+    # DIFF vs upstream (verl.utils.fsdp_utils.collect_lora_params): this wrapper
+    # adds an explicit ``adapter_name`` (named policy adapters), the diffusers
+    # layered walker with ``layer_prefixes``, and FSDP wrapper-token name
+    # cleaning. The upstream fast path survives only for the default adapter on
+    # non-diffusers-layered, non-FSDP2 modules; everything else flows through
+    # the adapter-aware implementation below.
+    # A single-rank FSDP1 actor uses NO_SHARD. The upstream layered
+    # collector's fallback summons with offload_to_cpu=True, which PyTorch
+    # rejects for NO_SHARD. Materialize on device and copy the adapter tensors
+    # to CPU through our non-layered collector instead. Nested block wraps leave
+    # ``_fsdp_wrapped_module`` inside those names, so clean them like the other paths.
+    from torch.distributed.fsdp import ShardingStrategy
+
+    if (
+        layered_summon
+        and base_sync_done
+        and fsdp_version(module) == 1
+        and getattr(module, "sharding_strategy", None) == ShardingStrategy.NO_SHARD
+    ):
+        peft_model = getattr(module, "_fsdp_wrapped_module", module)
+        params = _collect_lora_params_non_layered(module, peft_model, adapter_name, base_sync_done=True)
+        return _clean_lora_param_names(params, adapter_name)
+
+    use_diffusers_layered = is_diffusers and layered_summon and fsdp_version(module) > 0
+    if adapter_name == "default" and not use_diffusers_layered and fsdp_version(module) != 2:
+        params = _upstream_collect_lora_params(module, layered_summon=layered_summon, base_sync_done=base_sync_done)
+        return _clean_lora_param_names(params, adapter_name) if base_sync_done else params
+
+    if is_diffusers:
+        layered_summon_fn = partial(
+            _layered_summon_lora_params_diffusers, adapter_name=adapter_name, layer_prefixes=layer_prefixes
+        )
+    else:
+        layered_summon_fn = _upstream_layered_summon_lora_params
+
+    peft_model = getattr(module, "_fsdp_wrapped_module", module)
+    if fsdp_version(module) > 0:
+        if layered_summon:
+            if not base_sync_done:
+                raise ValueError(
+                    "To use layered_summon, you must make sure base-model is preloaded in vllm, e.g. let "
+                    "rollout.load_format=safetensors"
+                )
+            if layered_summon_fn is _upstream_layered_summon_lora_params:
+                lora_params = layered_summon_fn(module)
+            else:
+                lora_params = layered_summon_fn(module, adapter_name=adapter_name)
+        else:
+            lora_params = _collect_lora_params_non_layered(module, peft_model, adapter_name, base_sync_done)
+    elif base_sync_done:
+        lora_params = _peft_lora_params_to_cpu(peft_model, adapter_name)
+    else:
+        lora_params = _collect_base_weights_to_cpu(peft_model)
+    # Prefix walker only visits ``transformer_blocks.<i>``. Same fallback as
+    # verl (full summon + PEFT dump); name-scan if tuner prefixes still miss.
+    if not lora_params and layered_summon and base_sync_done:
+        import logging
+
+        logging.getLogger(__name__).warning("layered_summon returned empty, falling back to full LoRA collect")
+        peft_model = getattr(module, "_fsdp_wrapped_module", module)
+        if fsdp_version(module) == 1:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from verl.utils.device import get_torch_device
+
+            with FSDP.summon_full_params(module, writeback=False, offload_to_cpu=True):
+                lora_params = _peft_or_named_lora(peft_model, adapter_name)
+            get_torch_device().empty_cache()
+        else:
+            lora_params = _peft_or_named_lora(peft_model, adapter_name)
+    if not lora_params:
+        if layered_summon:
+            detail = (
+                f"with prefixes={layer_prefixes}. Check ``fsdp_layer_prefixes`` in the "
+                "model config matches the model's FSDP layer naming "
+                "(e.g. ``['transformer_blocks.']`` for DiT models)."
+            )
+        else:
+            detail = "(FSDP LoRA collection returned no tensors)."
+        raise RuntimeError(f"collect_lora_params collected 0 parameters {detail}")
+    return _clean_lora_param_names(lora_params, adapter_name) if base_sync_done else lora_params

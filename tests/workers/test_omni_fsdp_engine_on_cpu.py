@@ -1,0 +1,980 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""CPU-only wiring tests for ``OmniFSDPEngine`` (``unittest.mock``, no GPU).
+
+Loads ``omni_impl.py`` via ``importlib`` with pre-mocked ``sys.modules`` to
+bypass ``vllm_omni`` (CUDA-only). Verifies registration, import sources,
+``_build_module`` dispatch, LoRA dtype handling, and export delegation.
+"""
+
+import ast
+import importlib.util
+import os
+import sys
+import types
+from contextlib import contextmanager
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+import torch
+from tensordict import TensorDict
+from tensordict.tensorclass import NonTensorData, NonTensorStack
+from verl.utils import tensordict_utils as tu
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+_OMNI_IMPL_PATH = str(
+    (Path(__file__).parent.parent.parent / "verl_omni" / "workers" / "engine" / "fsdp" / "omni_impl.py").resolve()
+)
+
+_VERL_OMNI_DIR = str((Path(__file__).parent.parent.parent / "verl_omni").resolve())
+
+
+def _parse_omni_impl_ast():
+    """Parse ``omni_impl.py`` to an AST for static-analysis tests."""
+    with open(_OMNI_IMPL_PATH) as f:
+        return ast.parse(f.read())
+
+
+def _make_mock_model_config(**overrides):
+    """Build a minimal ``OmniModelConfig``-like mock for test wiring."""
+    cfg = MagicMock()
+    cfg.architecture = "Qwen3OmniMoeForConditionalGeneration"
+    cfg.model_stage = "thinker"
+    cfg.local_path = "/fake/model/path"
+    cfg.trust_remote_code = False
+    cfg.external_lib = None
+    cfg.use_liger = False
+    cfg.use_fused_kernels = False
+    cfg.enable_gradient_checkpointing = False
+    cfg.lora_rank = 0
+    cfg.lora = {}
+
+    hf_config = MagicMock()
+    thinker_config = types.SimpleNamespace(tie_word_embeddings=False)
+    hf_config.thinker_config = thinker_config
+    cfg.hf_config = hf_config
+
+    def _get(key, default=None):
+        return getattr(cfg, key, default)
+
+    cfg.get = _get
+
+    for k, v in overrides.items():
+        setattr(cfg, k, v)
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Isolated module loader
+# ---------------------------------------------------------------------------
+
+_omni_impl_cache = None
+
+
+def _get_omni_impl_module():
+    """Load ``omni_impl.py`` with pre-mocked ``sys.modules`` to bypass CUDA.
+
+    Returns a cached module after the first call.
+    """
+    global _omni_impl_cache
+    if _omni_impl_cache is not None:
+        return _omni_impl_cache
+
+    # If the module was already imported during pytest collection (e.g. by
+    # ``test_omni_fsdp_merge_on_cpu.py``), reuse it to avoid re-running the
+    # ``@EngineRegistry.register`` decorator and triggering a duplicate-key
+    # assertion.
+    _OMNI_IMPL_FQN = "verl_omni.workers.engine.fsdp.omni_impl"
+    if _OMNI_IMPL_FQN in sys.modules:
+        _omni_impl_cache = sys.modules[_OMNI_IMPL_FQN]
+        return _omni_impl_cache
+
+    root_mod = sys.modules.setdefault("verl_omni", types.ModuleType("verl_omni"))
+    root_mod.__path__ = [_VERL_OMNI_DIR]
+    utils_mod = sys.modules.setdefault("verl_omni.utils", types.ModuleType("verl_omni.utils"))
+    utils_mod.__path__ = [os.path.join(_VERL_OMNI_DIR, "utils")]
+
+    # Pre-mock verl_omni sub-packages whose ``__init__.py`` triggers CUDA.
+    for modname in (
+        "verl_omni.pipelines",
+        "verl_omni.models",
+        "verl_omni.reward_loop",
+        "verl_omni.trainer",
+        "verl_omni.workers.rollout",
+    ):
+        if modname not in sys.modules:
+            sys.modules[modname] = types.ModuleType(modname)
+
+    # Make ``verl_omni.pipelines`` a real package so ``model_base`` is found.
+    pipelines_mod = sys.modules.get("verl_omni.pipelines")
+    if not hasattr(pipelines_mod, "__path__"):
+        pipelines_mod.__path__ = [os.path.join(_VERL_OMNI_DIR, "pipelines")]
+
+    # ``verl_omni.workers.engine`` — mock as a package so submodule traversal works.
+    engine_mod = sys.modules.get("verl_omni.workers.engine")
+    if engine_mod is None or not hasattr(engine_mod, "__path__"):
+        engine_mod = types.ModuleType("verl_omni.workers.engine")
+        engine_mod.__path__ = [os.path.join(_VERL_OMNI_DIR, "workers", "engine")]
+        sys.modules["verl_omni.workers.engine"] = engine_mod
+
+    # Mock ``vllm_omni`` (CUDA-only, pulled in transitively).
+    if "vllm_omni" not in sys.modules:
+        sys.modules["vllm_omni"] = types.ModuleType("vllm_omni")
+
+    # Load ``verl_omni.pipelines.model_base`` (needed by ``_build_module``).
+    model_base_path = os.path.join(_VERL_OMNI_DIR, "pipelines", "model_base.py")
+    spec_mb = importlib.util.spec_from_file_location("verl_omni.pipelines.model_base", model_base_path)
+    model_base_mod = importlib.util.module_from_spec(spec_mb)
+    sys.modules["verl_omni.pipelines.model_base"] = model_base_mod
+    spec_mb.loader.exec_module(model_base_mod)
+
+    # Load ``omni_impl.py``.
+    spec = importlib.util.spec_from_file_location("verl_omni.workers.engine.fsdp.omni_impl", _OMNI_IMPL_PATH)
+    omni_impl = importlib.util.module_from_spec(spec)
+    sys.modules["verl_omni.workers.engine.fsdp.omni_impl"] = omni_impl
+    spec.loader.exec_module(omni_impl)
+
+    _omni_impl_cache = omni_impl
+    return omni_impl
+
+
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+
+
+def test_engine_registered_via_decorator():
+    """``@EngineRegistry.register`` decorator metadata via AST inspection."""
+    tree = _parse_omni_impl_ast()
+    class_def = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "OmniFSDPEngine":
+            class_def = node
+            break
+
+    assert class_def is not None, "OmniFSDPEngine class not found"
+
+    decorator_found = False
+    for decorator in class_def.decorator_list:
+        if not isinstance(decorator, ast.Call):
+            continue
+        func = decorator.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "EngineRegistry"
+            and func.attr == "register"
+        ):
+            continue
+        kwargs_found = 0
+        for kw in decorator.keywords:
+            if kw.arg == "model_type" and isinstance(kw.value, ast.Constant):
+                if kw.value.value == "omni_model":
+                    kwargs_found += 1
+            if kw.arg == "backend" and isinstance(kw.value, ast.List):
+                vals = [e.value for e in kw.value.elts if isinstance(e, ast.Constant)]
+                if set(vals) == {"fsdp", "fsdp2"}:
+                    kwargs_found += 1
+            if kw.arg == "device" and isinstance(kw.value, ast.List):
+                vals = [e.value for e in kw.value.elts if isinstance(e, ast.Constant)]
+                if set(vals) == {"cuda", "npu", "xpu"}:
+                    kwargs_found += 1
+        assert kwargs_found >= 2, (
+            f"@EngineRegistry.register missing expected kwargs (model_type/backend/device); found {kwargs_found}/3"
+        )
+        decorator_found = True
+        break
+
+    assert decorator_found, "@EngineRegistry.register decorator not found on OmniFSDPEngine"
+
+
+def test_engine_registered_for_fsdp_and_fsdp2_backends():
+    """``EngineRegistry`` has ``omni_model`` registered for fsdp and fsdp2."""
+    from verl.workers.engine.base import EngineRegistry
+
+    _get_omni_impl_module()
+
+    engines = EngineRegistry._engines
+    assert "omni_model" in engines, f"'omni_model' not in EngineRegistry._engines. Keys: {list(engines)}"
+    omni_registry = engines["omni_model"]
+
+    for backend in ("fsdp", "fsdp2"):
+        assert backend in omni_registry, f"'{backend}' not registered for omni_model; registered: {list(omni_registry)}"
+        for device in ("cuda", "npu", "xpu"):
+            entry = omni_registry[backend].get(device)
+            assert entry is not None, f"No engine for omni_model/{backend}/{device}"
+            assert entry.__name__ == "OmniFSDPEngine", (
+                f"Engine for omni_model/{backend}/{device} is {entry.__name__}, expected OmniFSDPEngine"
+            )
+
+
+def test_engine_get_engine_cls_resolves_to_omni_fsdp_engine():
+    """``EngineRegistry.get_engine_cls`` returns ``OmniFSDPEngine``."""
+    from verl.workers.engine.base import EngineRegistry
+
+    _get_omni_impl_module()
+
+    with patch("verl.workers.engine.base.get_device_name", return_value="cuda"):
+        for backend in ("fsdp", "fsdp2"):
+            cls = EngineRegistry.get_engine_cls("omni_model", backend)
+            assert cls.__name__ == "OmniFSDPEngine", (
+                f"get_engine_cls('omni_model', '{backend}') returned {cls.__name__}, expected OmniFSDPEngine"
+            )
+
+
+def test_direct_preference_reuses_base_train_and_infer_batch_methods():
+    """DPO should branch inside the engine lifecycle, not via a separate train/infer API."""
+    omni_impl = _get_omni_impl_module()
+
+    assert omni_impl.OmniFSDPEngine.train_batch is omni_impl.FSDPEngineWithLMHead.train_batch
+    assert omni_impl.OmniFSDPEngine.infer_batch is omni_impl.FSDPEngineWithLMHead.infer_batch
+
+
+def test_policy_gradient_prepare_model_inputs_delegates_to_base_engine():
+    """Policy-gradient omni input preparation stays on verl's language-model path."""
+    omni_impl = _get_omni_impl_module()
+    engine = object.__new__(omni_impl.OmniFSDPEngine)
+    engine.model_config = _make_mock_model_config(trainer_type="policy_gradient")
+    engine.model_adapter_cls = types.SimpleNamespace(
+        prepare_model_inputs=lambda model_inputs, _micro_batch, _model_config: model_inputs
+    )
+    engine._trainer_type = "policy_gradient"
+    micro_batch = TensorDict({}, batch_size=[0])
+
+    with patch.object(
+        omni_impl.FSDPEngineWithLMHead,
+        "prepare_model_inputs",
+        return_value=({"input_ids": torch.ones(1, 1, dtype=torch.long)}, {"base": True}),
+    ) as mock_prepare:
+        model_inputs, output_args = engine.prepare_model_inputs(micro_batch)
+
+    mock_prepare.assert_called_once_with(micro_batch)
+    assert set(model_inputs) == {"input_ids"}
+    assert output_args == {"base": True}
+
+
+def test_direct_preference_prepare_model_inputs_delegates_to_base_engine():
+    """DPO input preparation reuses verl's language-model path."""
+    omni_impl = _get_omni_impl_module()
+    engine = object.__new__(omni_impl.OmniFSDPEngine)
+    engine.model_config = _make_mock_model_config(trainer_type="direct_preference")
+    engine.model_adapter_cls = types.SimpleNamespace(
+        prepare_model_inputs=lambda model_inputs, _micro_batch, _model_config: model_inputs
+    )
+    engine._trainer_type = "direct_preference"
+    micro_batch = TensorDict({"input_ids": torch.ones(2, 3, dtype=torch.long)}, batch_size=[])
+
+    with patch.object(
+        omni_impl.FSDPEngineWithLMHead,
+        "prepare_model_inputs",
+        return_value=({"input_ids": torch.ones(2, 3, dtype=torch.long)}, {"base": True}),
+    ) as mock_base_prepare:
+        model_inputs, output_args = engine.prepare_model_inputs(micro_batch)
+
+    mock_base_prepare.assert_called_once_with(micro_batch)
+    assert set(model_inputs) == {"input_ids"}
+    assert output_args == {"base": True}
+
+
+def test_prepare_model_inputs_applies_registered_adapter_hook():
+    """The omni engine delegates model-native replay inputs to its adapter."""
+    omni_impl = _get_omni_impl_module()
+    engine = object.__new__(omni_impl.OmniFSDPEngine)
+    engine.model_config = _make_mock_model_config(trainer_type="policy_gradient")
+    engine._trainer_type = "policy_gradient"
+    replay_payloads = [
+        {"conditioning": torch.ones(2, 3)},
+        {"conditioning": torch.ones(2, 3) * 2},
+    ]
+    micro_batch = TensorDict(
+        {"test_talker_replay": NonTensorStack.from_list([NonTensorData(payload) for payload in replay_payloads])},
+        batch_size=[2],
+    )
+
+    class Adapter:
+        @classmethod
+        def prepare_model_inputs(cls, model_inputs, replay_batch, model_config):
+            assert model_config is engine.model_config
+            payloads = tu.get(replay_batch, "test_talker_replay")
+            conditioning = torch.stack([payload["conditioning"] for payload in payloads])
+            return {**model_inputs, "conditioning": conditioning}
+
+    engine.model_adapter_cls = Adapter
+    with patch.object(
+        omni_impl.FSDPEngineWithLMHead,
+        "prepare_model_inputs",
+        return_value=({"input_ids": torch.ones(1, 1, dtype=torch.long)}, {"base": True}),
+    ):
+        model_inputs, output_args = engine.prepare_model_inputs(micro_batch)
+
+    assert model_inputs["conditioning"].shape == (2, 2, 3)
+    assert model_inputs["conditioning"][1].tolist() == [[2.0] * 3] * 2
+    assert output_args == {"base": True}
+
+
+# ---------------------------------------------------------------------------
+# ``collect_lora_params`` import source
+# ---------------------------------------------------------------------------
+
+
+def test_uses_verl_omni_collect_lora_params():
+    """The shared export uses ``verl_omni.utils.fsdp_utils`` collect (not verl's)."""
+    import verl_omni.workers.engine.lora_export as lora_export
+    from verl_omni.utils.fsdp_utils import collect_lora_params as expected_func
+
+    assert lora_export.collect_lora_params is expected_func, "lora_export.collect_lora_params is not the verl_omni copy"
+
+
+def test_collect_lora_params_import_not_from_verl():
+    """AST has no ``collect_lora_params`` from ``verl.utils.fsdp_utils``."""
+    tree = _parse_omni_impl_ast()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "verl.utils.fsdp_utils":
+            for alias in node.names:
+                assert alias.name != "collect_lora_params", (
+                    "omni_impl imports collect_lora_params from verl.utils.fsdp_utils "
+                    "(should be verl_omni.utils.fsdp_utils)"
+                )
+
+
+# ---------------------------------------------------------------------------
+# ``_build_module`` calls adapter ``configure_model``
+# ---------------------------------------------------------------------------
+
+
+def test_build_module_uses_adapter_selected_auto_model_class():
+    """Adapters select non-default auto model classes without relying on stage names."""
+    omni_impl = _get_omni_impl_module()
+    assert omni_impl.AutoModelForMultimodalLM is not None
+
+    tree = _parse_omni_impl_ast()
+    import_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "transformers":
+            for alias in node.names:
+                import_names.add(alias.name)
+    assert "AutoModelForMultimodalLM" in import_names, (
+        f"AutoModelForMultimodalLM not imported from transformers; imports: {import_names}"
+    )
+    assert "AutoModelForTextToWaveform" not in import_names
+    assert "AutoModelForCausalLM" not in import_names, "AutoModelForCausalLM should NOT be imported from transformers"
+
+
+@pytest.mark.parametrize(
+    ("architecture", "model_stage"),
+    [
+        ("Qwen3OmniMoeForConditionalGeneration", "thinker"),
+        ("FutureOmniForConditionalGeneration", "talker"),
+    ],
+)
+def test_build_module_calls_adapter_configure_model(architecture, model_stage):
+    """Mock ``from_pretrained``; verify ``adapter_cls.configure_model(module, cfg)``."""
+    omni_impl = _get_omni_impl_module()
+    model_config = _make_mock_model_config(architecture=architecture, model_stage=model_stage)
+
+    fake_module = MagicMock(spec=torch.nn.Module)
+    fake_module.named_parameters.return_value = [("weight", torch.nn.Parameter(torch.randn(2, 2)))]
+
+    fake_adapter_cls = MagicMock()
+    fake_adapter_cls.auto_model_class = None
+    fake_configured_module = MagicMock(spec=torch.nn.Module)
+    fake_configured_module.named_parameters.return_value = [("weight", torch.nn.Parameter(torch.randn(2, 2)))]
+    fake_adapter_cls.configure_model.return_value = fake_configured_module
+
+    model_base_mod = sys.modules["verl_omni.pipelines.model_base"]
+
+    with (
+        patch.object(
+            omni_impl.AutoModelForMultimodalLM, "from_pretrained", return_value=fake_module
+        ) as mock_from_pretrained,
+        patch.object(model_base_mod.OmniModelBase, "get_class_by_name", return_value=fake_adapter_cls) as mock_get_cls,
+        patch.object(omni_impl, "get_init_weight_context_manager", return_value=MagicMock()),
+        patch.object(omni_impl.warnings, "catch_warnings", return_value=MagicMock()),
+        patch("verl.utils.torch_dtypes.PrecisionType") as precision_type,
+    ):
+        precision_type.to_dtype.side_effect = lambda value: value
+        engine = object.__new__(omni_impl.OmniFSDPEngine)
+        engine.model_config = model_config
+        engine.engine_config = MagicMock()
+        engine.engine_config.model_dtype = None
+        engine.engine_config.forward_only = False
+        engine.engine_config.strategy = "fsdp2"
+        engine.device_mesh = None
+
+        result = engine._build_module()
+
+        mock_from_pretrained.assert_called_once()
+        call_kwargs = mock_from_pretrained.call_args.kwargs
+        assert call_kwargs["pretrained_model_name_or_path"] == model_config.local_path
+        assert call_kwargs["trust_remote_code"] == model_config.trust_remote_code
+        assert call_kwargs["config"] is model_config.hf_config
+
+        mock_get_cls.assert_called_once_with(
+            architecture,
+            model_config.model_stage,
+            model_config.get("external_lib"),
+        )
+
+        fake_adapter_cls.configure_model.assert_called_once_with(fake_module, model_config)
+        assert engine.model_adapter_cls is fake_adapter_cls
+        assert result is fake_configured_module
+
+
+def test_build_module_calls_adapter_selected_auto_model_loader():
+    omni_impl = _get_omni_impl_module()
+    model_config = _make_mock_model_config(
+        architecture="FutureOmniForConditionalGeneration",
+        model_stage="talker",
+    )
+    loaded_module = MagicMock(spec=torch.nn.Module)
+    loaded_module.named_parameters.return_value = [("weight", torch.nn.Parameter(torch.randn(2, 2)))]
+    configured_module = MagicMock(spec=torch.nn.Module)
+    configured_module.named_parameters.return_value = [("weight", torch.nn.Parameter(torch.randn(2, 2)))]
+    auto_model_cls = MagicMock()
+    auto_model_cls.from_pretrained.return_value = loaded_module
+    adapter_cls = MagicMock()
+    adapter_cls.auto_model_class = auto_model_cls
+    adapter_cls.configure_model.return_value = configured_module
+    model_base_mod = sys.modules["verl_omni.pipelines.model_base"]
+
+    with (
+        patch.object(model_base_mod.OmniModelBase, "get_class_by_name", return_value=adapter_cls),
+        patch.object(omni_impl, "get_init_weight_context_manager", return_value=MagicMock()),
+        patch.object(omni_impl.warnings, "catch_warnings", return_value=MagicMock()),
+        patch("verl.utils.torch_dtypes.PrecisionType") as precision_type,
+    ):
+        precision_type.to_dtype.side_effect = lambda value: value
+        engine = object.__new__(omni_impl.OmniFSDPEngine)
+        engine.model_config = model_config
+        engine.engine_config = MagicMock(model_dtype=None, forward_only=False)
+        engine.engine_config.strategy = "fsdp2"
+        engine.device_mesh = None
+
+        result = engine._build_module()
+
+    auto_model_cls.from_pretrained.assert_called_once_with(
+        pretrained_model_name_or_path=model_config.local_path,
+        torch_dtype=torch.float32,
+        config=model_config.hf_config,
+        trust_remote_code=model_config.trust_remote_code,
+    )
+    adapter_cls.configure_model.assert_called_once_with(loaded_module, model_config)
+    assert result is configured_module
+
+
+def test_build_module_rejects_mixed_frozen_parameters_without_fsdp1_orig_params():
+    omni_impl = _get_omni_impl_module()
+    model_config = _make_mock_model_config()
+    loaded_module = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 2))
+    configured_module = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 2))
+    configured_module[0].requires_grad_(False)
+    adapter_cls = MagicMock()
+    adapter_cls.auto_model_class = None
+    adapter_cls.configure_model.return_value = configured_module
+    model_base_mod = sys.modules["verl_omni.pipelines.model_base"]
+
+    with (
+        patch.object(model_base_mod.OmniModelBase, "get_class_by_name", return_value=adapter_cls),
+        patch.object(omni_impl.AutoModelForMultimodalLM, "from_pretrained", return_value=loaded_module),
+        patch.object(omni_impl, "get_init_weight_context_manager", return_value=MagicMock()),
+        patch.object(omni_impl.warnings, "catch_warnings", return_value=MagicMock()),
+        patch("verl.utils.torch_dtypes.PrecisionType") as precision_type,
+    ):
+        precision_type.to_dtype.side_effect = lambda value: value
+        engine = object.__new__(omni_impl.OmniFSDPEngine)
+        engine.model_config = model_config
+        engine.engine_config = MagicMock(model_dtype=None, forward_only=False)
+        engine.engine_config.strategy = "fsdp"
+        engine.engine_config.use_orig_params = False
+        engine.device_mesh = None
+
+        with pytest.raises(ValueError, match="use_orig_params=true"):
+            engine._build_module()
+
+
+@pytest.mark.parametrize("option", ["use_liger", "use_fused_kernels"])
+def test_build_module_rejects_unsupported_optimizations_before_model_load(option):
+    omni_impl = _get_omni_impl_module()
+    engine = object.__new__(omni_impl.OmniFSDPEngine)
+    engine.model_config = _make_mock_model_config(**{option: True})
+
+    with patch.object(omni_impl.AutoModelForMultimodalLM, "from_pretrained") as mock_from_pretrained:
+        with pytest.raises(ValueError, match=rf"{option}=True"):
+            engine._build_module()
+
+    mock_from_pretrained.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# ``_build_lora_module`` dtype handling
+# ---------------------------------------------------------------------------
+
+
+def test_build_lora_module_casts_to_target_dtype():
+    """Mock a module with LoRA params; verify cast to ``lora_dtype`` and tuner flag."""
+    pytest.importorskip("peft")
+
+    from peft.tuners.tuners_utils import BaseTunerLayer
+
+    omni_impl = _get_omni_impl_module()
+    model_config = _make_mock_model_config(lora_dtype="float32", lora_rank=8)
+
+    fake_module = MagicMock(spec=torch.nn.Module)
+    lora_param = torch.nn.Parameter(torch.randn(2, 2, dtype=torch.float32), requires_grad=True)
+    base_param = torch.nn.Parameter(torch.randn(2, 2, dtype=torch.float32), requires_grad=False)
+    fake_module.named_parameters.return_value = [
+        ("base.weight", base_param),
+        ("lora_A", lora_param),
+    ]
+
+    fake_tuner = MagicMock(spec=BaseTunerLayer)
+    fake_module.modules.return_value = [fake_module, fake_tuner]
+
+    with (
+        patch.object(omni_impl.FSDPEngineWithLMHead, "_build_lora_module", return_value=fake_module),
+        patch("verl.utils.torch_dtypes.PrecisionType") as mock_prec,
+    ):
+        mock_prec.to_dtype.return_value = torch.float32
+        engine = object.__new__(omni_impl.OmniFSDPEngine)
+        engine.model_config = model_config
+
+        result = engine._build_lora_module(fake_module)
+        assert result is fake_module
+        assert fake_tuner.cast_input_dtype_enabled is False
+
+
+def test_build_lora_module_bfloat16_cast():
+    """LoRA params cast float32→bfloat16 when ``lora_dtype='bfloat16'``."""
+    pytest.importorskip("peft")
+
+    from peft.tuners.tuners_utils import BaseTunerLayer
+
+    omni_impl = _get_omni_impl_module()
+    model_config = _make_mock_model_config(lora_dtype="bfloat16", lora_rank=8)
+
+    fake_module = MagicMock(spec=torch.nn.Module)
+    lora_param = torch.nn.Parameter(torch.randn(2, 2, dtype=torch.float32), requires_grad=True)
+    base_param = torch.nn.Parameter(torch.randn(2, 2), requires_grad=False)
+    fake_module.named_parameters.return_value = [
+        ("base.weight", base_param),
+        ("lora_B", lora_param),
+    ]
+    fake_tuner = MagicMock(spec=BaseTunerLayer)
+    fake_module.modules.return_value = [fake_module, fake_tuner]
+
+    with (
+        patch.object(omni_impl.FSDPEngineWithLMHead, "_build_lora_module", return_value=fake_module),
+        patch("verl.utils.torch_dtypes.PrecisionType") as mock_prec,
+    ):
+        mock_prec.to_dtype.return_value = torch.bfloat16
+        engine = object.__new__(omni_impl.OmniFSDPEngine)
+        engine.model_config = model_config
+
+        result = engine._build_lora_module(fake_module)
+        assert result is fake_module
+        assert lora_param.data.dtype == torch.bfloat16, f"lora_param.dtype={lora_param.data.dtype}, expected bfloat16"
+        assert base_param.data.dtype == torch.float32, f"base_param.dtype={base_param.data.dtype}, expected unchanged"
+        assert fake_tuner.cast_input_dtype_enabled is False
+
+
+def test_build_lora_module_skips_when_lora_dtype_none():
+    """No-op when ``lora_dtype`` is ``None``."""
+    omni_impl = _get_omni_impl_module()
+    model_config = _make_mock_model_config(lora_dtype=None, lora_rank=8)
+
+    fake_module = MagicMock(spec=torch.nn.Module)
+    fake_module.named_parameters.return_value = [("weight", torch.nn.Parameter(torch.randn(2, 2)))]
+
+    with patch.object(omni_impl.FSDPEngineWithLMHead, "_build_lora_module", return_value=fake_module):
+        engine = object.__new__(omni_impl.OmniFSDPEngine)
+        engine.model_config = model_config
+        assert engine._build_lora_module(fake_module) is fake_module
+
+
+# ---------------------------------------------------------------------------
+# Direct preference forward lifecycle
+# ---------------------------------------------------------------------------
+
+
+def test_direct_preference_prepare_model_outputs_for_training():
+    """Training output preparation reuses verl's language-model path."""
+    omni_impl = _get_omni_impl_module()
+    engine = object.__new__(omni_impl.OmniFSDPEngine)
+    engine.model_config = _make_mock_model_config(trainer_type="direct_preference")
+    engine._trainer_type = "direct_preference"
+
+    micro_batch = TensorDict({"input_ids": torch.ones(2, 3, dtype=torch.long)}, batch_size=[])
+    raw_output = types.SimpleNamespace(logits=torch.zeros(4, 3, 8))
+
+    with patch.object(
+        omni_impl.FSDPEngineWithLMHead,
+        "prepare_model_outputs",
+        return_value={"log_probs": torch.ones(2, 3)},
+    ) as mock_prepare:
+        model_output = engine.prepare_model_outputs(
+            output=raw_output,
+            output_args={"base": True},
+            micro_batch=micro_batch,
+            logits_processor_func=object(),
+        )
+
+    mock_prepare.assert_called_once()
+    assert set(model_output) == {"log_probs"}
+    torch.testing.assert_close(model_output["log_probs"], torch.ones(2, 3))
+
+
+def test_direct_preference_prepare_model_outputs_for_inference():
+    """Reference inference output preparation reuses verl's language-model path."""
+    omni_impl = _get_omni_impl_module()
+    engine = object.__new__(omni_impl.OmniFSDPEngine)
+    engine.model_config = _make_mock_model_config(trainer_type="direct_preference")
+    engine._trainer_type = "direct_preference"
+
+    micro_batch = TensorDict({"input_ids": torch.ones(2, 3, dtype=torch.long)}, batch_size=[])
+    raw_output = types.SimpleNamespace(logits=torch.zeros(4, 3, 8))
+
+    with patch.object(
+        omni_impl.FSDPEngineWithLMHead,
+        "prepare_model_outputs",
+        return_value={"log_probs": torch.ones(2, 3)},
+    ) as mock_prepare:
+        model_output = engine.prepare_model_outputs(
+            output=raw_output,
+            output_args={"base": True},
+            micro_batch=micro_batch,
+            logits_processor_func=None,
+        )
+
+    mock_prepare.assert_called_once()
+    assert set(model_output) == {"log_probs"}
+    torch.testing.assert_close(model_output["log_probs"], torch.ones(2, 3))
+
+
+def test_postprocess_batch_func_converts_preference_outputs_to_nested_tensor():
+    """DPO inference postprocess reuses the base jagged NestedTensor path."""
+    from verl.utils import tensordict_utils as tu
+    from verl.workers.engine.fsdp.transformer_impl import postprocess_batch_func
+
+    data = TensorDict({}, batch_size=[3])
+    tu.assign_non_tensor(data, use_dynamic_bsz=False)
+
+    outputs = postprocess_batch_func(
+        output_lst=[
+            {
+                "model_output": {"log_probs": torch.tensor([[1.0], [2.0]])},
+                "loss": 0.0,
+                "metrics": {"metric": 1.0},
+            },
+            {
+                "model_output": {"log_probs": torch.tensor([[3.0]])},
+                "loss": 0.0,
+                "metrics": {"metric": 2.0},
+            },
+        ],
+        indices=None,
+        data=data,
+    )
+
+    log_probs = outputs["model_output"]["log_probs"]
+    assert log_probs.is_nested
+    torch.testing.assert_close(log_probs.values(), torch.tensor([1.0, 2.0, 3.0]))
+    assert outputs["loss"] == [0.0, 0.0]
+    assert outputs["metrics"]["metric"] == [1.0, 2.0]
+
+
+class TestAdapterNameForwarding:
+    def test_get_per_tensor_param_routes_adapter_name(self):
+        # A non-default adapter must reach collect_lora_params and select the
+        # matching peft_config; silently falling back to "default" broadcasts
+        # the wrong adapter in async LoRA sync.
+        import torch.nn as nn
+
+        omni_impl = _get_omni_impl_module()
+
+        module = nn.Module()
+        module.thinker = nn.Linear(2, 2)
+        old_cfg, default_cfg = MagicMock(), MagicMock()
+        old_cfg.to_dict.return_value = {"adapter": "old"}
+        default_cfg.to_dict.return_value = {"adapter": "default"}
+        module.peft_config = {"default": default_cfg, "old": old_cfg}
+
+        engine = object.__new__(omni_impl.OmniFSDPEngine)
+        engine.module = module
+        engine.model_config = _make_mock_model_config()
+        engine._uses_fsdp2_cpu_offload_policy = True
+        engine._is_offload_param = False
+        engine._qat_enabled = False
+
+        captured = {}
+
+        def fake_collect(module, layered_summon, base_sync_done, adapter_name="default", **kwargs):
+            captured["adapter_name"] = adapter_name
+            return {"w": torch.zeros(1)}
+
+        import verl_omni.workers.engine.lora_export as lora_export
+
+        with (
+            patch.object(omni_impl, "log_gpu_memory_usage", MagicMock()),
+            patch.object(lora_export, "collect_lora_params", side_effect=fake_collect),
+            patch.object(lora_export, "convert_weight_keys", side_effect=lambda params, module: params),
+        ):
+            per_tensor_param, peft_config = engine.get_per_tensor_param(base_sync_done=True, adapter_name="old")
+
+        assert captured["adapter_name"] == "old"
+        assert peft_config == {"adapter": "old"}
+        assert dict(per_tensor_param).keys() == {"w"}
+
+
+class TestDeltaShardExportGate:
+    """The omni engine's inherited shard export is valid only for full-weight,
+    non-QAT runs; the other export paths rename/revalue tensors (RFC #38 audit)."""
+
+    def test_shard_export_fails_closed_under_qat(self):
+        omni_impl = _get_omni_impl_module()
+        engine = object.__new__(omni_impl.OmniFSDPEngine)
+        engine._qat_enabled = True
+        with pytest.raises(NotImplementedError, match="QAT"):
+            engine.get_per_tensor_param_shard()
+
+    def test_shard_export_fails_closed_under_lora(self):
+        omni_impl = _get_omni_impl_module()
+        engine = object.__new__(omni_impl.OmniFSDPEngine)
+        engine._qat_enabled = False
+        engine.module = types.SimpleNamespace(peft_config={"default": object()})
+        with pytest.raises(NotImplementedError, match="full-weight"):
+            engine.get_per_tensor_param_shard()
+
+    def test_shard_export_delegates_to_verl_when_full_weight(self, monkeypatch):
+        """Full-weight, non-QAT: the inherited export yields identity-named local
+        shards matching the plain state_dict (the audit's positive case)."""
+        omni_impl = _get_omni_impl_module()
+        from verl.workers.engine.fsdp import transformer_impl
+
+        monkeypatch.setattr(transformer_impl, "get_device_id", lambda: torch.device("cpu"))
+
+        engine = object.__new__(omni_impl.OmniFSDPEngine)
+        engine._qat_enabled = False
+        engine._uses_fsdp2_cpu_offload_policy = False
+        engine._is_offload_param = False
+        engine.module = torch.nn.Linear(3, 2, bias=False)
+
+        ((name, local, spec),) = list(engine.get_per_tensor_param_shard()[0])
+        assert name == "weight"  # no conversion mapping, no prefix on the omni path
+        assert spec.full_shape == (2, 3)
+        assert torch.equal(local, engine.module.weight.reshape(-1).to(torch.bfloat16))
+
+
+def _fsdp2_engine(omni_impl, module, ignored_names, strategy="fsdp2"):
+    """A bare engine whose adapter returns ``ignored_names`` from the model-base hook."""
+    engine = object.__new__(omni_impl.OmniFSDPEngine)
+    engine.model_config = _make_mock_model_config()
+    engine.model_config.enable_activation_offload = False
+    engine.model_config.enable_gradient_checkpointing = False
+    engine.device_mesh = None
+    adapter_cls = MagicMock()
+    adapter_cls.get_fsdp_ignored_module_names.return_value = ignored_names or []
+    engine.model_adapter_cls = adapter_cls
+    engine.engine_config = types.SimpleNamespace(
+        strategy=strategy,
+        mixed_precision=None,
+        offload_policy=False,
+        forward_only=False,
+        reshard_after_forward=True,
+        forward_prefetch=False,
+        use_orig_params=True,
+        wrap_policy={},
+        get=lambda key, default=None: {},
+    )
+    return engine
+
+
+def _patch_process_group_and_mesh_helpers(monkeypatch, omni_impl):
+    """Stub the module-level pieces that need a process group / real device on CPU."""
+    monkeypatch.setattr(omni_impl, "get_sharding_strategy", lambda mesh, zero3_enable: None)
+    monkeypatch.setattr(omni_impl, "get_fsdp_wrap_policy", lambda **kwargs: None)
+    monkeypatch.setattr(omni_impl, "fsdp2_load_full_state_dict", lambda *args, **kwargs: None)
+    monkeypatch.setattr(omni_impl, "get_device_id", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 1)
+
+
+class _FrozenTowerModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.tower = torch.nn.Linear(4, 4)
+        # Ignored subtrees must be frozen: FSDP2 never syncs their gradients.
+        self.tower.requires_grad_(False)
+        self.llm = torch.nn.Module()
+        self.llm.layer = torch.nn.Linear(4, 4)
+        self._no_split_modules = ["DecoderLayer"]
+
+
+def test_build_fsdp_module_injects_ignored_params_on_root_only(monkeypatch):
+    omni_impl = _get_omni_impl_module()
+    module = _FrozenTowerModule()
+
+    class _Layer(torch.nn.Module):
+        pass
+
+    wrap_target = _Layer()
+    module.llm.layer = wrap_target
+    calls = []
+
+    def fake_fully_shard(target, **kwargs):
+        calls.append((target, kwargs.get("ignored_params")))
+        return target
+
+    import verl.utils.fsdp_utils as verl_fsdp_utils
+    import verl.utils.torch_dtypes as torch_dtypes
+
+    monkeypatch.setattr(torch.distributed.fsdp, "fully_shard", fake_fully_shard)
+    monkeypatch.setattr(verl_fsdp_utils, "_select_fsdp2_wrap_targets", lambda model, names: [wrap_target])
+    monkeypatch.setattr(verl_fsdp_utils, "maybe_patch_fsdp_module", lambda model: contextmanager(lambda: (yield))())
+    monkeypatch.setattr(torch_dtypes.PrecisionType, "to_dtype", staticmethod(lambda name: torch.bfloat16))
+    _patch_process_group_and_mesh_helpers(monkeypatch, omni_impl)
+
+    engine = _fsdp2_engine(omni_impl, module, ["tower"])
+    result = engine._build_fsdp_module(module)
+
+    assert result is module
+    assert len(calls) == 2
+    # Nested wrap target never carries the root's ignored set...
+    assert calls[0][0] is wrap_target and calls[0][1] is None
+    # ...only the root fully_shard call gets the tower parameters.
+    assert calls[1][0] is module
+    assert calls[1][1] == set(module.tower.parameters())
+
+    # No adapter-declared subtrees: the override still runs the fsdp2 build rather
+    # than delegating, with an empty ignored set.
+    delegated = []
+    monkeypatch.setattr(
+        omni_impl.OmniFSDPEngine.__bases__[0], "_build_fsdp_module", lambda self, m: delegated.append(m)
+    )
+    engine = _fsdp2_engine(omni_impl, module, None)
+    engine._build_fsdp_module(module)
+    assert delegated == []
+    assert calls[-1][1] == set()
+
+
+def test_build_fsdp_module_fsdp1_branch(monkeypatch):
+    # fsdp1 stays available for adapters declaring no ignored subtrees, and
+    # fails closed when they do (this override only implements the fsdp2 wrap).
+    omni_impl = _get_omni_impl_module()
+    module = _FrozenTowerModule()
+    captured = {}
+
+    def fake_fsdp(model, **kwargs):
+        captured.update(kwargs)
+        return model
+
+    monkeypatch.setattr(omni_impl, "FSDP", fake_fsdp)
+    monkeypatch.setattr(omni_impl, "init_fn", lambda *args, **kwargs: None)
+    _patch_process_group_and_mesh_helpers(monkeypatch, omni_impl)
+
+    engine = _fsdp2_engine(omni_impl, module, None, strategy="fsdp")
+    assert engine._build_fsdp_module(module) is module
+    assert captured["use_orig_params"] is True
+    assert captured["mixed_precision"].buffer_dtype == torch.float32  # upstream's default
+    assert captured["cpu_offload"] is None  # forward_only=False
+
+    engine = _fsdp2_engine(omni_impl, module, ["tower"], strategy="fsdp")
+    with pytest.raises(NotImplementedError, match="strategy=fsdp2"):
+        engine._build_fsdp_module(module)
+
+
+def test_build_fsdp_module_rejects_trainable_ignored_params(monkeypatch):
+    # FSDP2 never communicates gradients for ignored params; a trainable one
+    # would silently diverge across ranks on a multi-rank mesh.
+    omni_impl = _get_omni_impl_module()
+    module = _FrozenTowerModule()
+    module.tower.requires_grad_(True)  # e.g. a LoRA target/exclude drift
+
+    import verl.utils.fsdp_utils as verl_fsdp_utils
+    import verl.utils.torch_dtypes as torch_dtypes
+
+    monkeypatch.setattr(torch.distributed.fsdp, "fully_shard", lambda target, **kwargs: target)
+    monkeypatch.setattr(verl_fsdp_utils, "_select_fsdp2_wrap_targets", lambda model, names: [])
+    monkeypatch.setattr(verl_fsdp_utils, "maybe_patch_fsdp_module", lambda model: contextmanager(lambda: (yield))())
+    monkeypatch.setattr(torch_dtypes.PrecisionType, "to_dtype", staticmethod(lambda name: torch.bfloat16))
+    _patch_process_group_and_mesh_helpers(monkeypatch, omni_impl)
+
+    engine = _fsdp2_engine(omni_impl, module, ["tower"])
+    engine.device_mesh = types.SimpleNamespace(size=lambda: 2)
+    with pytest.raises(ValueError, match="FSDP2-ignored parameters must be frozen"):
+        engine._build_fsdp_module(module)
+
+
+class _TowerWithEmbeddingModule(torch.nn.Module):
+    """An ignored tower holding an nn.Embedding leaf that verl's selector blanket-wraps."""
+
+    def __init__(self):
+        super().__init__()
+        self.tower = torch.nn.Module()
+        self.tower.embed_positions = torch.nn.Embedding(16, 4)  # blanket-wrapped by verl's selector
+        self.tower.conv1 = torch.nn.Linear(4, 4)
+        # Ignored subtrees must be frozen: FSDP2 never syncs their gradients.
+        self.tower.requires_grad_(False)
+        self.llm = torch.nn.Module()
+        self.llm.layer = torch.nn.Linear(4, 4)
+        self.model = torch.nn.Module()
+        self.model.embed_tokens = torch.nn.Embedding(16, 4)  # top-level embedding, NOT ignored
+        self._no_split_modules = ["DecoderLayer"]
+
+
+def test_build_fsdp_module_skips_wrap_targets_under_ignored_subtrees(monkeypatch):
+    omni_impl = _get_omni_impl_module()
+    module = _TowerWithEmbeddingModule()
+
+    calls = []
+
+    def fake_fully_shard(target, **kwargs):
+        calls.append((target, kwargs.get("ignored_params")))
+        return target
+
+    import verl.utils.fsdp_utils as verl_fsdp_utils
+    import verl.utils.torch_dtypes as torch_dtypes
+
+    # verl's selector blanket-wraps every nn.Embedding, including tower.embed_positions.
+    monkeypatch.setattr(
+        verl_fsdp_utils,
+        "_select_fsdp2_wrap_targets",
+        lambda model, names: [module.llm.layer, module.tower.embed_positions, module.model.embed_tokens],
+    )
+    monkeypatch.setattr(torch.distributed.fsdp, "fully_shard", fake_fully_shard)
+    monkeypatch.setattr(verl_fsdp_utils, "maybe_patch_fsdp_module", lambda model: contextmanager(lambda: (yield))())
+    monkeypatch.setattr(torch_dtypes.PrecisionType, "to_dtype", staticmethod(lambda name: torch.bfloat16))
+    _patch_process_group_and_mesh_helpers(monkeypatch, omni_impl)
+
+    engine = _fsdp2_engine(omni_impl, module, ["tower"])
+    engine._build_fsdp_module(module)
+
+    wrapped = [target for target, _ in calls[:-1]]
+    assert module.llm.layer in wrapped
+    assert module.model.embed_tokens in wrapped  # top-level embedding still wrapped
+    # The ignored-subtree embedding is never claimed by a nested fully_shard...
+    assert module.tower.embed_positions not in wrapped
+    # ...so the root's ignored set owns every tower param, embed_positions included.
+    root_ignored = calls[-1][1]
+    assert module.tower.embed_positions.weight in root_ignored
+    assert module.tower.conv1.weight in root_ignored
+
+    # Identity when nothing is ignored, so adapters declaring nothing wrap every target.
+    from verl_omni.utils.fsdp_utils import _filter_ignored_wrap_targets
+
+    targets = [module.llm.layer, module.tower.embed_positions]
+    assert _filter_ignored_wrap_targets(targets, module, []) == targets

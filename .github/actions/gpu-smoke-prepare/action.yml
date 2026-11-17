@@ -1,0 +1,34 @@
+name: GPU smoke job prepare
+description: Install GPU smoke test dependencies
+
+runs:
+  using: composite
+  steps:
+    - name: Install dependencies
+      shell: bash
+      env:
+        HTTP_PROXY: "http://100.68.174.87:3128"
+        HTTPS_PROXY: "http://100.68.174.87:3128"
+        NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
+        UV_EXTRA_INDEX_URL: https://pypi.org/simple
+        PIP_EXTRA_INDEX_URL: https://pypi.org/simple
+        UV_SYSTEM_PYTHON: "1"
+        UV_BREAK_SYSTEM_PACKAGES: "1"
+        PIP_BREAK_SYSTEM_PACKAGES: "1"
+        UV_LINK_MODE: copy
+      run: |
+        export UV_CACHE_DIR="${UV_CACHE_DIR:-${HOME}/.cache/uv}"
+        git config --global http.postBuffer 524288000 || true
+        uv pip install --system --break-system-packages -e ".[gpu,dev,audio,omni,ocr]"
+        # VeOmni overwrites: its [gpu] extra pins torch 2.11 and conflicts with the vLLM stack (docs/start/engine_backends.md).
+        # TODO: rm --no-deps when VeOmni supports the vLLM torch pin (torch 2.13 as of vLLM 0.30).
+        uv pip install --system --break-system-packages veomni==0.1.12 --no-deps
+        # The released qwen-tts targets Transformers 4.57.3; install the pinned upstream Transformers 5 archive without touching this repo's stack.
+        uv pip install --system --break-system-packages --no-deps --reinstall \
+          "qwen-tts @ https://github.com/QwenLM/Qwen3-TTS/archive/$(cat .github/qwen_tts_pin.txt).tar.gz"
+        uv pip install --system --break-system-packages --no-deps \
+          "boogu-image @ git+https://github.com/boogu-project/Boogu-Image.git@$(cat .github/boogu_image_pin.txt)"
+        # uv.cu130 ships python3 only; Ray/scripts may still invoke `python`.
+        if ! command -v python >/dev/null 2>&1; then
+          ln -sfn "$(command -v python3)" /usr/local/bin/python
+        fi

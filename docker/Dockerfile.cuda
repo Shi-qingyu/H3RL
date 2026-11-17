@@ -1,0 +1,87 @@
+# verl-omni GPU image — dependency versions aligned with docs/start/install.md
+#
+# Build (from repo root):
+#   docker build -f docker/Dockerfile.cuda -t verl-omni:gpu .
+#
+# Override the verl pin (vllm/kernels versions come from the pyproject extras):
+#   docker build -f docker/Dockerfile.cuda -t verl-omni:gpu \
+#     --build-arg VERL_GIT_REF=fefb080262e1c015a0ea05f958822a6a512dc795 .
+#
+# Build with dev extras (pytest, pre-commit, …):
+#   docker build -f docker/Dockerfile.cuda --target dev -t verl-omni:gpu-dev .
+#
+# Run:
+#   docker run --gpus all --shm-size=16g -it verl-omni:gpu
+#
+# The base is pinned to CUDA 13.0.2 to match the cu130-pinned Python stack.
+# Bumping CUDA means changing the base image, the --torch-backend below, and
+# the pyproject pins together.
+
+ARG UBUNTU_VERSION=22.04
+# Default: read from .github/verl_pin.txt at build time (override with VERL_GIT_REF).
+ARG VERL_GIT_REF=
+
+FROM nvidia/cuda:13.0.2-cudnn-devel-ubuntu${UBUNTU_VERSION} AS base
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG VERL_GIT_REF
+
+# Python >= 3.10 (3.12 recommended), CUDA 13.0
+ENV PYTHONUNBUFFERED=1 \
+    UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=0 \
+    UV_PYTHON_DOWNLOADS=manual \
+    VIRTUAL_ENV=/opt/venv \
+    PATH="/root/.local/bin:/opt/venv/bin:${PATH}" \
+    LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    git \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Raise nofile limit: uv stdlib bytecode compile opens many files at once.
+RUN ulimit -n 65536 \
+    && curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && uv python install 3.12 \
+    && uv venv "${VIRTUAL_ENV}" --python 3.12 --seed
+
+WORKDIR /workspace/verl-omni
+
+COPY pyproject.toml setup.py README.md ./
+COPY .github/verl_pin.txt ./.github/
+COPY verl_omni ./verl_omni
+
+# Step 1 — gpu extra (kernels, liger-kernel, cupy-cuda13x); vllm, vllm-omni and verl arrive via core deps.
+# cu130 is pinned for build determinism against the CUDA 13.0.2 base; `auto` would
+# depend on the build host's driver (install.md uses `auto` outside Docker).
+RUN uv pip install --torch-backend=cu130 ".[gpu]"
+
+# Step 2 — verl core dependency (from .github/verl_pin.txt, overridable via VERL_GIT_REF)
+RUN VERL_REF="${VERL_GIT_REF:-$(tr -d '[:space:]' < .github/verl_pin.txt)}" \
+    && echo "Installing verl@${VERL_REF}" \
+    && uv pip install --no-deps \
+        "verl @ git+https://github.com/verl-project/verl.git@${VERL_REF}"
+
+# Step 3 — verl-omni core dependencies (editable)
+RUN uv pip install -e .
+
+
+FROM base AS runtime
+WORKDIR /workspace/verl-omni
+CMD ["/bin/bash"]
+
+# Optional: dev extra (pytest, pre-commit, …)
+FROM base AS dev
+RUN uv pip install -e ".[dev]"
+
+# Optional: ocr extra (FlowGRPO OCR reward)
+FROM base AS ocr
+RUN uv pip install -e ".[ocr]"
+
+# Optional: VeOmni engine backend ("Optional engine backends")
+FROM base AS veomni
+RUN uv pip install veomni==0.1.12 --no-deps \
+    && uv pip install torchcodec librosa soundfile av audioread

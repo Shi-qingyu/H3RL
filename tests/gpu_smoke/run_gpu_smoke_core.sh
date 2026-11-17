@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Core GPU smoke tests (2-GPU): rollout, engines, agent loop, and reward loop.
+
+set -euo pipefail
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib_gpu_smoke.sh"
+gpu_smoke_init "ci-core" 2 "$@"
+
+# Agent-loop (esp. step_execution + TP=2) is the memory-sensitive case; run it
+# before the rollout generate smoke so workers start on a clean GPU.
+run_test 0 "diffusion agent loop" \
+    env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" \
+    python3 -m pytest -s tests/agent_loop/test_diffusion_agent_loop.py
+
+run_test 1 "vllm-omni rollout" \
+    env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" \
+    python3 -m pytest -s tests/workers/rollout/rollout_vllm/test_vllm_omni_generate.py
+
+run_test 2 "diffusers FSDP engine" \
+    env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" \
+    python3 -m pytest -s tests/workers/test_diffusers_fsdp_engine.py
+
+# Skips itself if the optional `veomni` backend is not installed (importorskip).
+run_test 3 "diffusers VeOmni engine" \
+    env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" \
+    python3 -m pytest -s tests/workers/test_diffusers_veomni_engine.py
+
+run_test 4 "diffusion rollout seed multi-worker" \
+    env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" \
+    python3 -m pytest -s tests/agent_loop/test_diffusion_rollout_seed_gpu.py
+
+run_test 5 "visual reward manager" \
+    env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" \
+    python3 -m pytest -s tests/reward_loop/test_visual_reward_manager.py
+
+run_test 6 "diffusion composite agent loop" \
+    env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" \
+    python3 -m pytest -s tests/agent_loop/test_composite_agent_loop.py
+
+run_test 7 "OmniAgentLoopWorker image_gen tool agent loop" \
+    env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" \
+    python3 -m pytest -s tests/agent_loop/test_omni_agent_loop_worker_gpu.py
+
+# Ulysses sequence-parallel equivalence tests (needs torchrun; sp=4 cases
+# self-skip on 2 GPUs, non-native backends self-skip without `kernels`).
+run_test 8 "diffusers ulysses sp" \
+    env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" \
+    torchrun --nproc_per_node="${NUM_GPUS}" --local-ranks-filter=0 tests/workers/test_diffusers_ulysses.py
+
+run_test 8 "trainable FSDP2 snapshot restore" \
+    env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" REQUIRE_TRAINABLE_SNAPSHOT_GPU=1 \
+    python3 -m pytest -s tests/workers/test_trainable_snapshot_gpu.py
+
+gpu_smoke_summary

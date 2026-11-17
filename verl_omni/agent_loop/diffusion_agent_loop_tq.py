@@ -1,0 +1,319 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import asyncio
+import logging
+import os
+from typing import Any
+
+import ray
+import torch
+import transfer_queue as tq
+from tensordict import NonTensorData, NonTensorStack, TensorDict
+from verl.experimental.agent_loop import get_trajectory_info
+from verl.utils.ray_utils import auto_await
+from verl.utils.tensordict_utils import list_of_dict_to_tensordict
+
+from verl_omni.agent_loop.diffusion_agent_loop import (
+    DiffusionAgentLoopWorker,
+    _config_to_sampling_dict,
+    _InternalDiffusionAgentLoopOutput,
+)
+from verl_omni.agent_loop.utils import derive_rollout_seed
+from verl_omni.pipelines.rollout_media import ARTIFACT_CONTEXT, ARTIFACT_SPECS, PREVIEW_ARTIFACT, PRIMARY_ARTIFACT
+
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
+@ray.remote
+class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
+    """TransferQueue-backed diffusion agent loop worker."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        tq.init()
+        self.background_tasks = set()
+
+    async def generate_sequences(self, batch: TensorDict) -> None:
+        """Spawn diffusion agent loops for each prompt in the batch without waiting."""
+        validate = batch["validate"] if "validate" in batch else False
+        if isinstance(validate, NonTensorData):
+            validate = validate.data
+        batch.pop("validate", None)
+
+        config = self.rollout_config
+        sampling_params = {
+            **_config_to_sampling_dict(config.pipeline),
+            **_config_to_sampling_dict(config.algo),
+            "logprobs": config.calculate_log_probs,
+        }
+
+        rollout_base_seed = None
+        global_steps = batch["global_steps"] if "global_steps" in batch else None
+        if isinstance(global_steps, NonTensorData):
+            global_steps = global_steps.data
+        if global_steps is not None:
+            sampling_params["global_steps"] = global_steps
+
+        if validate:
+            sampling_params.update(_config_to_sampling_dict(config.val_kwargs.pipeline))
+            sampling_params.update(_config_to_sampling_dict(config.val_kwargs.algo))
+            sampling_params["seed"] = config.val_kwargs.seed
+            sampling_params["logprobs"] = False
+            # Re-assert global_steps in case the val_kwargs update above is ever
+            # extended to carry a "global_steps" key in the future.
+            if global_steps is not None:
+                sampling_params["global_steps"] = global_steps
+        else:
+            sampling_params["global_steps"] = global_steps
+            rollout_seed_meta = batch.get("rollout_seed")
+            if rollout_seed_meta is not None:
+                rollout_base_seed = int(
+                    rollout_seed_meta.data if isinstance(rollout_seed_meta, NonTensorData) else rollout_seed_meta
+                )
+
+        # by default, we assume it's a single turn agent
+        if "agent_name" not in batch:
+            default_agent_loop = config.agent.default_agent_loop
+            batch["agent_name"] = NonTensorData(default_agent_loop)
+
+        index = batch["index"] if "index" in batch else list(range(len(batch)))
+        trajectory_info = await get_trajectory_info(global_steps, index, bool(validate))
+
+        for i in range(len(batch)):
+            prompt = self._extract_prompt(batch, i)
+            task = asyncio.create_task(
+                self._run_prompt(
+                    prompt,
+                    sampling_params,
+                    trajectory=trajectory_info[i],
+                    prompt_index=int(index[i]),
+                    rollout_base_seed=rollout_base_seed,
+                )
+            )
+            self.background_tasks.add(task)
+            task.add_done_callback(self.background_tasks.discard)
+
+    @staticmethod
+    def _extract_prompt(batch: TensorDict, i: int) -> dict:
+        """Extract per-sample fields from a TensorDict row."""
+        prompt = {}
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                prompt[k] = v[i]
+            elif isinstance(v, NonTensorStack):
+                prompt[k] = v[i].data
+            elif isinstance(v, NonTensorData):
+                prompt[k] = v.data
+            else:
+                logger.exception(f"Unsupported type {type(v)} for key {k}")
+        return prompt
+
+    async def _run_prompt(
+        self,
+        prompt: dict,
+        sampling_params: dict,
+        trajectory: dict,
+        prompt_index: int,
+        rollout_base_seed: int | None = None,
+    ) -> None:
+        """Spawn ``rollout.n`` sessions per prompt and write trajectories to TQ."""
+        uid = prompt["uid"]
+        partition_id = "val" if trajectory["validate"] else "train"
+        await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "running"})
+        tasks = []
+        try:
+            config = self.rollout_config
+            n = config.val_kwargs.n if trajectory["validate"] else config.n
+            for session_id in range(n):
+                run_sampling_params = dict(sampling_params)
+                if rollout_base_seed is not None and not trajectory["validate"]:
+                    # Seed from the position within the generation batch (v0
+                    # semantics): each worker only sees a chunk of the batch, so
+                    # a chunk-local position would reuse the same seed offsets
+                    # in every worker and roll out duplicated noise.
+                    run_sampling_params["seed"] = derive_rollout_seed(rollout_base_seed, prompt_index * n + session_id)
+                task = asyncio.create_task(
+                    self._run_agent_loop(
+                        run_sampling_params,
+                        session_id=session_id,
+                        trajectory=trajectory,
+                        **prompt,
+                    )
+                )
+                tasks.append(task)
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            successes = [
+                (session_id, result)
+                for session_id, result in enumerate(results)
+                if not isinstance(result, BaseException)
+            ]
+            errors = [result for result in results if isinstance(result, BaseException)]
+            for error in errors:
+                logger.error(
+                    f"Error in _run_prompt for uid={uid}",
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+            # One put per prompt group instead of one per session: every TQ put
+            # is a ZMQ roundtrip carrying the full image payload, and the
+            # replay buffer waits for the whole group anyway, so per-session
+            # puts serialize the gen tail (64 -> 16 puts at rollout.n=4).
+            if successes:
+                await self._write_trajectories_to_tq(
+                    successes,
+                    uid=uid,
+                    trajectory=trajectory,
+                    validate=trajectory["validate"],
+                    global_steps=sampling_params.get("global_steps"),
+                    **{k: v for k, v in prompt.items() if k not in {"uid", "global_steps"}},
+                )
+            status = "failure" if errors else "finished"
+            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": status})
+        except Exception as e:
+            logger.exception(f"Error in _run_prompt for uid={uid}: {e}")
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
+
+    async def _run_agent_loop(
+        self,
+        sampling_params: dict[str, Any],
+        *,
+        agent_name: str,
+        session_id: int = 0,
+        trajectory: dict | None = None,
+        **kwargs,
+    ) -> _InternalDiffusionAgentLoopOutput:
+        """Run one diffusion agent loop session; the TQ write is batched per prompt."""
+        return await super()._run_agent_loop(
+            sampling_params,
+            agent_name=agent_name,
+            validate=trajectory["validate"] if trajectory else False,
+            **kwargs,
+        )
+
+    async def _write_trajectories_to_tq(
+        self,
+        outputs: list[tuple[int, _InternalDiffusionAgentLoopOutput]],
+        *,
+        uid: str,
+        trajectory: dict | None,
+        validate: bool,
+        global_steps: int | None = None,
+        **kwargs,
+    ) -> None:
+        """Write the finished sessions of one prompt as batched TransferQueue rows."""
+        partition_id = "val" if validate else "train"
+        # Track the rollout model version this trajectory was generated against.
+        step = trajectory["step"] if trajectory else global_steps
+
+        # Sessions of one group usually produce identical field sets; per-session
+        # reward scoring can differ, so partition rows by field signature to keep
+        # each put stackable.
+        rows: dict[tuple[str, ...], list[tuple[str, dict[str, Any], dict[str, Any]]]] = {}
+        for session_id, internal in outputs:
+            # Diffusion single-turn agent loops produce one output per session.
+            key = f"{uid}_{session_id}_0"
+
+            field: dict[str, Any] = {
+                "prompts": internal.prompt_ids.squeeze(0),
+                "responses": internal.response_diffusion_output.squeeze(0),
+                "__num_turns__": internal.num_turns,
+                "uid": uid,
+            }
+            if internal.response_logprobs is not None:
+                field["rollout_log_probs"] = internal.response_logprobs.squeeze(0)
+            if internal.reward_score is not None:
+                field["rm_scores"] = torch.tensor([internal.reward_score], dtype=torch.float32)
+
+            extra = internal.extra_fields
+            for extra_key, value in extra.items():
+                if isinstance(value, torch.Tensor):
+                    field[extra_key] = value.squeeze(0) if value.dim() >= 1 and value.shape[0] == 1 else value
+                elif extra_key == "audio_sample_rate":
+                    field[extra_key] = value
+
+            # Non-tensor dataset fields forwarded as-is.
+            for non_tensor_key in ["reward_model", "data_source", "extra_info", "raw_prompt"]:
+                if non_tensor_key in kwargs:
+                    field[non_tensor_key] = kwargs[non_tensor_key]
+
+            reward_extra_info = extra.get("reward_extra_info")
+            extra_fields_out: dict[str, Any] = {}
+            if "img_shapes" in extra:
+                extra_fields_out["img_shapes"] = extra["img_shapes"]
+            if reward_extra_info is not None:
+                extra_fields_out["reward_extra_info"] = reward_extra_info
+            # Tensor media (for example generated audio) is already carried as a
+            # top-level TQ field above. Preserve its non-tensor declaration/metadata
+            # in the envelope that ``diffusion_tq_batch_to_dataproto`` restores.
+            for media_key in (
+                "media_kind",
+                "audio_sample_rate",
+                ARTIFACT_SPECS,
+                PRIMARY_ARTIFACT,
+                PREVIEW_ARTIFACT,
+                ARTIFACT_CONTEXT,
+            ):
+                media_value = extra.get(media_key)
+                if media_key in extra and not isinstance(media_value, torch.Tensor):
+                    extra_fields_out[media_key] = media_value
+            extra_fields_out["min_global_steps"] = step
+            extra_fields_out["max_global_steps"] = step
+            field["extra_fields"] = extra_fields_out
+
+            prompt_len = int(internal.prompt_ids.shape[-1])
+            tag = {
+                "status": "success",
+                "prompt_len": prompt_len,
+                "response_len": 1,
+                "response_shape": tuple(int(dim) for dim in field["responses"].shape),
+                "seq_len": prompt_len + 1,
+                "global_steps": step,
+                "min_global_steps": step,
+                "max_global_steps": step,
+            }
+            # Identity of the prompt group for the trainer's v0 prompt-major
+            # row reordering: position inside its generation batch plus the
+            # per-run generation-batch number. ``index`` alone repeats across
+            # generation batches (DAPO refills, incomplete-group replacement,
+            # multi-chunk dispatches), so the pair is what stays unique.
+            prompt_index = kwargs.get("index")
+            if prompt_index is not None:
+                tag["prompt_index"] = int(prompt_index)
+            gen_batch_seq = kwargs.get("gen_batch_seq")
+            if gen_batch_seq is not None:
+                tag["gen_batch_seq"] = int(gen_batch_seq)
+            rows.setdefault(tuple(field.keys()), []).append((key, field, tag))
+
+        for group_rows in rows.values():
+            await tq.async_kv_batch_put(
+                keys=[key for key, _field, _tag in group_rows],
+                fields=list_of_dict_to_tensordict([field for _key, field, _tag in group_rows]),
+                tags=[tag for _key, _field, tag in group_rows],
+                partition_id=partition_id,
+            )
+
+
+@auto_await
+async def create_diffusion_agent_loop_manager(*args, **kwargs):
+    """Build verl's ``AgentLoopManagerTQ`` wired with ``DiffusionAgentLoopWorkerTQ``."""
+    from verl.trainer.ppo.v1 import AgentLoopManagerTQ
+
+    manager = AgentLoopManagerTQ(*args, **kwargs)
+    manager.agent_loop_workers_class = DiffusionAgentLoopWorkerTQ
+    await manager._init_agent_loop_workers()
+    return manager

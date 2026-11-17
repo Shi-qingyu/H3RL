@@ -1,0 +1,211 @@
+# -------------------------------
+# build-system
+# -------------------------------
+[build-system]
+requires = [
+    "setuptools>=61.0",
+    "wheel"
+]
+build-backend = "setuptools.build_meta"
+
+# -------------------------------
+# project (PEP 621 metadata)
+# -------------------------------
+[project]
+name = "verl-omni"
+dynamic = ["version"]
+description = "verl-omni: Easy, fast, and stable RL training for diffusion and omni-modality models"
+license = {text = "Apache-2.0"}
+readme = {file = "README.md", content-type = "text/markdown"}
+requires-python = ">=3.11"
+dependencies = [
+    "accelerate>=1.14.0",
+    "cachetools",
+    "codetiming",
+    "datasets>=2.20.0",
+    "diffusers>=0.41.0",
+    "dill",
+    "hydra-core",
+    "imageio[ffmpeg]>=2.37.2",
+    "pandas",
+    "peft",
+    "pyarrow>=19.0.0,<25.0.0",  # 25.0.0 breaks pd.read_parquet with ArrowInvalid: column length mismatch
+    "pybind11",
+    "pylatexenc",
+    "ray[default]",
+    "safetensors>=0.4.5",
+    "tensordict>=0.8.0,<=0.10.0,!=0.9.0",
+    "torchdata",
+    # TODO: Remove this cap after the Qwen3-Omni adapter and tests support the
+    # FSDP `_no_split_modules` metadata change introduced in Transformers 5.15.0.
+    "transformers>=5.13.0,<=5.14.1",
+    "wandb",
+    "packaging>=20.0",
+    "uvicorn",
+    "fastapi",
+    "latex2sympy2_extended",
+    "math_verify",
+    "mathruler",
+    "tensorboard",
+    "TransferQueue==0.1.9",
+    "vllm==0.30.0",
+    "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@12e9280010afc41ce5c6a1f46900fc329cf08377",
+    "verl @ git+https://github.com/verl-project/verl.git@fefb080262e1c015a0ea05f958822a6a512dc795",
+]
+
+[project.optional-dependencies]
+audio = [
+    "qwen-omni-utils>=0.0.9",
+    "audioread",
+]
+omni = [
+    "einops>=0.8.0",
+    "librosa>=0.10.2",
+    "onnxruntime>=1.20.0",
+    "soundfile>=0.12.1",
+    "sox>=1.5.0",
+    "torchaudio>=2.11.0",
+    "av",
+    "qwen-vl-utils>=0.0.14",
+]
+fa2 = [
+    "flash-attn>=2.8.3",
+]
+gpu = [
+    "kernels==0.16.0",
+    "liger-kernel",
+    "cupy-cuda13x",
+]
+xpu = [
+    # verl has no built-in Intel platform; the plugin registers it via the verl.plugins entry point.
+    "verl-hardware-plugin @ git+https://github.com/verl-project/verl-hardware-plugin.git@53c4de2626745543e45761711d4f6c265c508dc6",
+    # Ray counts Intel GPUs through dpctl; 0.22.x matches the oneAPI 2026 runtime of torch 2.13+xpu.
+    "dpctl>=0.22,<0.23",
+]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "pre-commit",
+    "py-spy",
+    "pytest-asyncio",
+    "pytest-rerunfailures",
+]
+ocr = [
+    "Levenshtein",
+]
+
+# -------------------------------
+# tool.ruff - Linting configuration
+# -------------------------------
+[tool.ruff]
+# Note: While the formatter will attempt to format lines such that they remain within the line-length,
+# it isn't a hard upper bound, and formatted lines may exceed the line-length.
+line-length = 120
+exclude = ["scripts/legacy_model_merger.py"]
+
+[tool.ruff.lint]
+isort = {known-first-party = ["verl_omni"]}
+# c.f. https://github.com/vllm-project/vllm/blob/ce8d6b75fc0586045df75ee1568a5b5f9957251b/pyproject.toml
+select = [
+    # pycodestyle
+    "E",
+    # Pyflakes
+    "F",
+    # pyupgrade
+    "UP",
+    # flake8-bugbear
+    "B",
+    # isort
+    "I",
+    "G",
+]
+ignore = [
+    # star imports
+    "F405", "F403",
+    # lambda expression assignment
+    "E731",
+    # Loop control variable not used within loop body
+    "B007",
+    # f-string format
+    "UP032",
+    # `.log()` statement uses f-string
+    "G004",
+    # X | None for type annotations
+    "UP045",
+    # deprecated import
+    "UP035",
+]
+
+# -------------------------------
+# tool.mypy - typechecking config
+# -------------------------------
+[tool.mypy]
+pretty            = true
+ignore_missing_imports = true
+explicit_package_bases = true
+follow_imports = "skip"
+
+# Blanket silence
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = [
+"verl_omni.trainer.config.algorithm",
+]
+ignore_errors = false
+
+# -------------------------------
+# tool.coverage - Test coverage
+# -------------------------------
+[tool.coverage.run]
+branch = true
+source = ["verl_omni"]
+omit = [
+    "verl_omni/version/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if __name__ == '__main__':",
+]
+
+# -------------------------------
+# tool.setuptools - Additional config
+# -------------------------------
+[tool.setuptools]
+# True means `setuptools` will attempt to include all relevant files in package_data automatically.
+# This corresponds to `include_package_data=True` in setup.py.
+include-package-data = true
+
+# We read the version from a file in 'verl_omni/version/version'
+[tool.setuptools.dynamic]
+version = {file = "verl_omni/version/version"}
+
+# If you need to mimic `package_dir={'': '.'}`:
+[tool.setuptools.package-dir]
+"" = "."
+
+# If you need to include specific non-Python data (like YAML files or version file):
+[tool.setuptools.package-data]
+verl_omni = [
+  "version/*",
+  "trainer/config/*.yaml",
+  "trainer/config/*/*.yaml",
+  "trainer/config/*/*/*.yaml",
+  "utils/agentic/*.json",
+]
+
+# -------------------------------
+# tool.uv - Package resolution overrides
+# -------------------------------
+[tool.uv]
+override-dependencies = [
+    "accelerate>=1.14.0",
+    "diffusers>=0.41.0",
+    "kernels==0.16.0",
+    "transformers>=5.13.0,<=5.14.1",
+]

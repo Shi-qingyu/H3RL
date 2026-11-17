@@ -1,1 +1,297 @@
-# H3_RL
+<div align="center">
+
+# VeRL-Omni
+
+### Easy, fast, and stable RL training for diffusion and omni-modality models
+
+<a href="https://deepwiki.com/verl-project/verl-omni"><img src="https://devin.ai/assets/deepwiki-badge.png" alt="Ask DeepWiki.com" style="height:20px;"></a>
+[![Docs](https://img.shields.io/badge/docs-Read%20the%20Docs-8A2BE2)](https://verl-omni.readthedocs.io/en/latest/index.html)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](./LICENSE) <a href="docs/assets/WeChat.jpg"><img src="https://img.shields.io/badge/微信-green?logo=wechat"></a> <a href="https://join.slack.com/t/verl-project/shared_invite/zt-4bb32of1g-c~szeecZ2fufGeSadsIefw"><img src="https://img.shields.io/badge/Slack-verl-blueviolet?logo=slack"></a> <a href="https://drive.google.com/file/d/1EGVFZdvRgSBymMlZa62FObbzEhMoLA0F/view?usp=sharing"><img src="https://img.shields.io/badge/Slides-verl--omni-orange?logo=google-drive&logoColor=white"></a>
+
+[English](https://github.com/verl-project/verl-omni/blob/main/README.md) | [简体中文](https://github.com/verl-project/verl-omni/blob/main/README.zh.md)
+
+</div>
+
+`VeRL-Omni` is a general RL training framework focused on multimodal generative models, built on top of [`verl`](https://github.com/verl-project/verl).
+
+It originated from the multi-modal generation RL effort in `verl`, and now has a dedicated home so it can evolve in a more focused way.
+
+## News 🔥
+- **[2026-10]** 🎉 We have released [v0.3.0](https://github.com/verl-project/verl-omni/releases/tag/v0.3.0) for fully async diffusion/omni RL with the v1 trainer as the default.
+- **[2026-10]** [OmniNFT](examples/omninft_trainer/README.md) is now supported for audio-video post-training. The [LTX2.3](examples/omninft_trainer/ltx2/README.md) text-to-video+audio LoRA recipe runs on Ascend NPU with modality-wise advantage routing.
+- **[2026-09]** The [v1 trainer](docs/start/diffusion_v1.md) (TransferQueue + ReplayBuffer) is now the default for diffusion models; the legacy v0 trainer is deprecated, while offline DPO remains on v0 by design.
+- **[2026-08]** **[DiffusionOPD](docs/algo/diffusion_opd.md)** (on-policy distillation, including multi-teacher MOPD) is now supported.
+- **[2026-08]** 🔥 **MiniMax-H3** now supports T2VA, FL2VA, and Ref2VA with both [FlowGRPO](examples/flowgrpo_trainer/minimax_h3/README.md) and [DiffusionNFT](examples/diffusionnft_trainer/minimax_h3/README.md).
+- **[2026-08]** 🎉 We have released [v0.2.0](https://github.com/verl-project/verl-omni/releases/tag/v0.2.0) for faster diffusion rl and more stable Qwen3-Omni multimodal training. Blog: [VeRL-Omni v0.2.0](https://verl-project.github.io/posts/2026-08-17-verl-omni-v0-2-0/)
+- **[2026-08]** [LTX2.3](examples/flowgrpo_trainer/ltx2/README.md) text-to-video+audio model is now supported with FlowGRPO.
+- **[2026-07]** Team-proposed algorithm [FlowGRPO with DiNa-LRM](https://verl-omni.readthedocs.io/en/latest/examples/flowgrpo_trainer_sd35_drm.html) is available. Training skips VAE decoding by scoring clean diffusion latents directly for faster and more resource-efficient model alignment.
+- **[2026-07]** VeRL-Omni is presented in QingKe AI, vLLM community, and verl x Ascend Beijing meetup. [Slides](https://drive.google.com/file/d/1RJBZZ2k6exxciFghU1FNUgds6s1w7Bpf/view?usp=sharing) are shared.
+- **[2026-06]** [Qwen3-Omni GSPO Trainer](examples/gspo_trainer) is available! [Flow-DPPO](https://verl-omni.readthedocs.io/en/latest/algo/flowdppo.html) is integrated. vLLM-Omni rollout backend is upgraded to v0.22 for higher throughput, with default actor attn backend switched to FA3.
+- **[2026-06]** [DiffusionNFT](https://verl-omni.readthedocs.io/en/latest/algo/diffusionnft.html) and [Diffusion DPO](https://verl-omni.readthedocs.io/en/latest/algo/diffusion_dpo.html) are integrated with verified recipes on Qwen-Image/SD3.5. [Wan2.2](examples/dancegrpo_trainer/README.md) is now supported for video generation tasks.  
+
+## Why `VeRL-Omni`
+
+Multimodal generative RL training differs from text-only LLM RL not only in model structure, but also in I/O patterns, compute characteristics, and runtime bottlenecks. As this space grows, it deserves a dedicated training repository that can evolve quickly around its own constraints.
+
+### Scope
+
+`VeRL-Omni` targets RL post-training for three families of generative models:
+
+1. **Diffusion generative models** for image, video, and audio — e.g., Qwen-Image, Wan2.2.
+2. **Unified multimodal understanding + generation models** — e.g., BAGEL, HunyuanImage-3.0.
+3. **Omni-modality models** that jointly handle text, image, audio, and video — e.g., Qwen3-Omni.
+
+### What we focus on
+
+- **Fast multi-modal rollout:** Adopt [`vLLM-Omni`](https://github.com/vllm-project/vllm-omni) backend and accelerate generation via rollout routing, rollout  batching, embed caching optimizations, and more.
+- **Flexible & async multi-reward serving:** Support multi-reward serving (HPSv3, GenRM-OCR, UnifiedReward, etc.), [HTTP scorer](https://verl-omni.readthedocs.io/en/latest/start/http_scorer.html), and [asynchronous reward computation](https://verl-omni.readthedocs.io/en/latest/algo/async_reward.html) to overlap the rollout phase.
+- **Modular training backends:** Selectable [VeOmni](https://github.com/ByteDance-Seed/VeOmni) and FSDP2 backends with combinable parallelism (USP/TP/DP) for distributed training.
+- **Stability:** Boost stability and speed in diffusion RL pipelines via [rollout correction](https://verl-omni.readthedocs.io/en/latest/algo/rollout_correction.html) to skip logP recomputation, and achieve reproducible E2E training with deterministic RL. Reward, rollout and actor update are composable and extensible, via Hydra configs.
+- **Efficient and convergent training recipes:** On our reference Qwen-Image FlowGRPO setup, `VeRL-Omni` achieves **~25% higher end-to-end throughput** than the diffusers-based [`flow_grpo`](https://github.com/yifan123/flow_grpo) implementation, driven by `vLLM-Omni` rollout, FSDP2 trainer, overlapped reward computation (asynchronous), etc.
+
+
+<div align="center">
+  <img src="docs/assets/arch.png" alt="verl-omni architecture diagram" width="70%">
+</div>
+
+
+## Getting Started  🚀
+
+Visit our [documentation](https://verl-omni.readthedocs.io/en/latest/index.html) to learn more.
+
+- [Installation](https://verl-omni.readthedocs.io/en/latest/start/install.html)
+- [Quickstart](https://verl-omni.readthedocs.io/en/latest/start/flowgrpo_quickstart.html)
+
+<table align="center">
+  <tr>
+    <td align="center">
+      <img src="https://github.com/user-attachments/assets/cb242db0-4233-4a1b-8274-5b3d87d69a36" alt="Training step 0" width="250"/>
+    </td>
+    <td align="center">
+      <img src="https://github.com/user-attachments/assets/af82391b-081d-46a3-9878-9113b89452cd" alt="Training step 120" width="250"/>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">Training step 0</td>
+    <td align="center">Training step 120</td>
+  </tr>
+</table>
+<p align="center"><b>Example: Optimizing Qwen-Image Text Rendering Accuracy with FlowGRPO</b>
+  (<a href="examples/flowgrpo_trainer/README.md" target="_blank">recipe</a>
+  &nbsp;|&nbsp;
+  <a href="https://wandb.ai/andyzhou/VeRL-Omni-demo/runs/8p8y9olb" target="_blank">wandb</a>)
+</p>
+
+## Model and Algorithm Support 🎨
+
+<table>
+  <tr>
+    <th>Model</th>
+    <th>Category</th>
+    <th>Modality</th>
+    <th>Algorithm</th>
+    <th>Status</th>
+  </tr>
+  <tr>
+    <td rowspan="6">Qwen-Image & Qwen-Image-Edit</td>
+    <td rowspan="6">Diffusion generator</td>
+    <td rowspan="6">Text/Image → Image</td>
+    <td>FlowGRPO (+ CPS/SDE)</td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td>Flow-DPPO</td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td>MixGRPO</td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td>GRPO-Guard</td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td>DiffusionNFT</td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td>DPO</td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td>Wan2.2</td>
+    <td>Diffusion generator</td>
+    <td>Text → Video</td>
+    <td>DanceGRPO</td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td rowspan="2">LTX2.3</td>
+    <td rowspan="2">Diffusion generator</td>
+    <td rowspan="2">Text → Video + Audio</td>
+    <td>FlowGRPO</td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td><a href="examples/omninft_trainer/README.md">OmniNFT</a></td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td rowspan="2"><b>MiniMax-H3</b></td>
+    <td rowspan="2">Diffusion generator</td>
+    <td rowspan="2">Any → Video + Audio</td>
+    <td>DiffusionNFT</td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td>FlowGRPO</td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td rowspan="2"><b>Boogu-Image</b></td>
+    <td rowspan="2">Diffusion generator</td>
+    <td rowspan="2">Text/Image → Image</td>
+    <td>FlowGRPO (+ CPS/SDE)</td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td>DiffusionNFT</td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td><a href="examples/dancegrpo_trainer/flux1/README.md">FLUX.1-dev</a></td>
+    <td>Diffusion generator</td>
+    <td>Text → Image</td>
+    <td>DanceGRPO</td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td>BAGEL</td>
+    <td>Unified understand + gen</td>
+    <td>Text + Image</td>
+    <td>FlowGRPO</td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td rowspan="6">SD3.5</td>
+    <td rowspan="6">Diffusion generator</td>
+    <td rowspan="6">Text → Image</td>
+    <td>DPO</td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td>FlowGRPO</td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td>FlowGRPO w/ DiNa-LRM</td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td><a href="docs/algo/diffusion_opd.md">DiffusionOPD</a> (incl. MOPD)</td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td><a href="docs/algo/dgpo.md">DGPO</a></td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td><a href="examples/awm_trainer/README.md">AWM</a></td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td rowspan="2">HunyuanImage-3.0</td>
+    <td rowspan="2">Unified understand + gen</td>
+    <td rowspan="2">Text + Image</td>
+    <td>MixGRPO</td>
+    <td>Planned</td>
+  </tr>
+  <tr>
+    <td>SRPO</td>
+    <td>Planned</td>
+  </tr>
+  <tr>
+    <td rowspan="4">Qwen3-Omni-Thinker</td>
+    <td rowspan="4">Omni-modality</td>
+    <td rowspan="4">Text / Image / Video / Audio</td>
+    <td>DPO</td>
+    <td>✅</td>
+  </tr>
+    <tr>
+    <td>GSPO</td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td><a href="docs/algo/omni_opd.md">OPD</a></td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td><a href="examples/dapo_trainer/README.md">DAPO (Phase 1, LoRA)</a></td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td rowspan="2">MiniCPM-o 4.5</td>
+    <td rowspan="2">Omni-modality</td>
+    <td rowspan="2">Image / Audio → Text</td>
+    <td><a href="examples/gspo_trainer/README.md#training-with-minicpm-o-45-avqa">GSPO</a></td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td><a href="examples/dpo_trainer/minicpm/README.md">DPO</a></td>
+    <td>✅</td>
+  </tr>
+    <tr>
+    <td rowspan="3">Qwen3-TTS</td>
+    <td rowspan="3">Audio-modality</td>
+    <td rowspan="3">Text → Audio</td>
+    <td>DPO</td>
+    <td>WIP</td>
+  </tr>
+  <tr>
+    <td>GSPO</td>
+    <td>WIP</td>
+  </tr>
+  <tr>
+    <td>GRPO</td>
+    <td>✅</td>
+  </tr>
+</table>
+
+
+## Ascend NPU Support 💠
+
+`VeRL-Omni` supports Ascend A2, A3, and A5 NPUs. See the [NPU installation guide](docs/start/install_npu.md) for setup and the [Ascend NPU Quickstart Guide](https://verl-omni.readthedocs.io/en/latest/start/flowgrpo_quickstart_npu.html) for FlowGRPO training.
+
+
+## Roadmap 🗺
+
+Future work is tracked in [VeRL-Omni Q4 Roadmap](https://github.com/verl-project/verl-omni/issues/700)
+
+## Contributing 🤝
+
+Contributions are welcome.
+
+See the [contribution guide](CONTRIBUTING.md).
+
+**Join the Community**: Feel free to ask questions, provide feedback, and discuss with fellow users of VeRL-Omni in our [WeChat group](docs/assets/WeChat.jpg).
+
+
+## Acknowledgement 🌟
+
+`verl-omni` builds on the engineering foundations developed in [`verl`](https://github.com/verl-project/verl) and is closely aligned with multimodal inference systems such as [`vLLM-Omni`](https://github.com/vllm-project/vllm-omni).
+
+## Citation 📚
+
+If you find the project helpful, please cite and star ⭐
+
+```bibtex
+@misc{verlomni_github,
+  title        = {{VeRL-Omni: Easy, Fast, and Stable RL Training for Diffusion and Omni-Modality Models}},
+  author       = {Yongxiang Huang and Cheung Kawai and Jingan Zhou and Yingshu Chen and {openYuanrong Team} and Xibin Wu},
+  year         = {2026},
+  howpublished = {\url{https://github.com/verl-project/verl-omni}},
+  urldate      = {2026-04-28}
+}
+```
+

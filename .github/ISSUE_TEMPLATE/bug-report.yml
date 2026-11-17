@@ -1,0 +1,105 @@
+# modified from https://github.com/huggingface/transformers/blob/main/.github/ISSUE_TEMPLATE/bug-report.yml?plain=1
+name: "\U0001F41B Bug Report"
+description: Submit a bug report to help us improve verl-omni
+labels: [ "bug" ]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this bug report! 🤗
+
+  - type: textarea
+    id: system-info
+    attributes:
+      label: System Info
+      description: Please share your system info with us. You can run the command `python scripts/diagnose.py` and copy-paste its output below.
+      placeholder: verl-omni version, platform, python version, ...
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: information-scripts-examples
+    attributes:
+      label: Information
+      description: 'The problem arises when using:'
+      options:
+        - label: "The official example scripts"
+        - label: "My own modified scripts"
+
+  - type: checkboxes
+    id: information-tasks
+    attributes:
+      label: Tasks
+      description: "The tasks I am working on are:"
+      options:
+        - label: "An officially supported task in the `examples` folder (such as QwenImage, ...)"
+        - label: "My own task or dataset (give details below)"
+
+  - type: textarea
+    id: reproduction
+    validations:
+      required: true
+    attributes:
+      label: Reproduction
+      description: |
+        Please provide a code sample that reproduces the problem you ran into. It can be a Colab link or just a code snippet.
+        Please include relevant config information with your code.
+        If you have code snippets, error messages, stack traces please provide them here as well.
+        Important! Use code tags to correctly format your code. See https://docs.github.com/en/get-started/writing-on-github/working-with-advanced-formatting/creating-and-highlighting-code-blocks
+        Do not use screenshots, as they are hard to read and (more importantly) don't allow others to copy-and-paste your code.
+
+      placeholder: |
+        Steps to reproduce the behavior:
+
+          1.
+          2.
+          3.
+
+
+  - type: textarea
+    id: expected-behavior
+    validations:
+      required: true
+    attributes:
+      label: Expected behavior
+      description: "A clear and concise description of what you would expect to happen."
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Please include the relevant Python logs, error messages, and stack traces if available.
+      render: shell
+
+  - type: textarea
+    id: who-can-help
+    attributes:
+      label: Who can help?
+      description: |
+        Please tag at most two maintainers who are familiar with the affected area.
+        If you are unsure, leave this blank and a core maintainer will route the issue.
+
+        Questions on algorithms:
+        - Diffusion PPO-related (e.g., FlowGRPO): @knlnguyen1802 @NancyFyong
+        - Omni PPO-related (e.g., Qwen3-Omni+GSPO): @zhtmike
+        - DAPO: @WenzheWang
+        - Distillation (e.g., OPD): @cr-gao
+        - Diffusion NFT: @NancyFyong @AndyZhou952 
+        - DPO: @wtomin
+
+        Questions on infrastructure and backend:
+        - NPU: @Sky-Trigger
+        - VeOmni: @WenzheWang @FoolPlayer
+        - vLLM-Omni: @samithuang @knlnguyen1802
+
+        Questions on core components:
+        - FSDP engine: @zhtmike
+        - Rollout or trainer: @zhtmike @knlnguyen1802 @ZihaoW123
+        - Reward: @chenyingshu @ruihanglix
+
+        Questions on pipelines:
+        - Pipelines and model adaptation: @chenyingshu @NancyFyong
+
+        Questions on CI, Docker, or documentation:
+        - CI, Docker, or documentation: @wtomin
+      placeholder: "@Username ..."

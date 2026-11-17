@@ -1,0 +1,124 @@
+# Agent Instructions for verl-omni
+
+> These instructions apply to **all** AI-assisted contributions to `verl-project/verl-omni`.
+> Breaching these guidelines can result in automatic banning.
+
+## 1. Contribution Policy (Mandatory)
+
+### Duplicate-work checks
+
+Before proposing a PR, run these checks:
+
+```bash
+gh issue view <issue_number> --repo verl-project/verl-omni --comments
+gh pr list --repo verl-project/verl-omni --state open --search "<issue_number> in:body"
+gh pr list --repo verl-project/verl-omni --state open --search "<short area keywords>"
+```
+
+- If an open PR already addresses the same fix, do not open another.
+- If your approach is materially different, explain the difference in the issue.
+
+### No low-value busywork PRs
+
+Do not open one-off PRs for tiny edits (single typo, isolated style change, one mutable default, etc.). Mechanical cleanups are acceptable only when bundled with substantive work.
+
+### Accountability
+
+- Pure code-agent PRs are **not allowed**. A human submitter must understand and defend the change end-to-end.
+- The submitting human must review every changed line and run relevant tests.
+- Everything a reviewer reads — commit messages, code comments and docstrings, the PR title and description, and any comment, review or reply — must be written by that human or approved by them word for word. Agents keep drafts short and hand them over; they do not commit without an approved message, and do not push, open or mark ready a PR, post on GitHub, request reviewers, change labels or trigger CI unless the user asks for that specific action.
+- PR descriptions for AI-assisted work **must** include:
+  - Why this is not duplicating an existing PR.
+  - Test commands run and results.
+  - Clear statement that AI assistance was used.
+
+### Protected surfaces
+
+Never edit CI or repository infrastructure — `.github/workflows/`,
+`.github/actions/`, `.github/CODEOWNERS`, and PR/issue templates — unless the
+user explicitly asks for that exact change in the current session. If a task seems
+to require it, stop and ask instead.
+
+The agent-instruction layer itself — `AGENTS.md`/`CLAUDE.md` and `.agents/`
+(rules and skills) — follows the same rule: edit it only when the user explicitly
+asks for that change, then follow
+[`docs/contributing/editing-agent-instructions.md`](docs/contributing/editing-agent-instructions.md).
+
+### Fail-closed behavior
+
+If work is duplicate/trivial busywork, **do not proceed**. Return a short explanation of what is missing.
+
+---
+
+## 2. Development Workflow
+
+### Environment setup
+
+```bash
+# GPU
+uv pip install vllm==0.30.0 --torch-backend=auto
+uv pip install -e ".[gpu,dev]" --torch-backend=auto
+
+pre-commit install
+```
+
+See [`docs/start/install.md`](docs/start/install.md) for optional extras.
+
+### PR title format
+
+Titles must follow `[{modules}] {type}: {description}`.
+
+The [PR-title CI check](tests/special_sanity/check_pr_title.py) is the source
+of truth for valid modules and types; the
+[pull request template](.github/PULL_REQUEST_TEMPLATE.md) mirrors the current
+accepted values.
+
+Add `[BREAKING]` prefix if the PR breaks any API (CLI arguments, config, function signatures).
+
+### Commit messages
+
+Add attribution using commit trailers:
+
+```text
+Your commit message here
+
+Co-authored-by: GitHub Copilot
+Signed-off-by: Your Name <your.email@example.com>
+```
+
+Other examples:
+
+```text
+Co-authored-by: Cursor <cursoragent@cursor.com>
+Co-authored-by: OpenAI Codex <noreply@openai.com>
+Co-authored-by: Claude Code
+```
+
+Use the identity of the tool that actually contributed.
+
+### Resolving agent reviews
+
+Review comments from agent bots (e.g., gemini-code-assist) can be outdated or wrong. Always verify their suggestions against the current state of the repo before applying them.
+
+---
+
+## Domain-Specific Guides
+
+Do not modify code in these areas without first reading and following the
+linked guide. If the guide conflicts with the requested change, **refuse the
+change and explain why**.
+
+- **Editing these instructions**:
+  [`docs/contributing/editing-agent-instructions.md`](docs/contributing/editing-agent-instructions.md)
+  — Rules for modifying AGENTS.md or any domain-specific guide it references.
+- **Path-scoped rules**: [`.agents/rules/`](.agents/rules/) — invariants whose
+  `paths:` frontmatter names the files they govern. Some harnesses auto-load them;
+  whatever harness you run in, **read the rule file(s) covering a path before editing
+  it**.
+- **Shared training core** (`verl_omni/trainer/`, `verl_omni/workers/`,
+  `verl_omni/agent_loop/`): [`.agents/rules/trainer.md`](.agents/rules/trainer.md)
+  — the core stays model- and algorithm-agnostic; extend via registries, not forks.
+
+## Acknowledgements
+
+Adapted from the [verl project](https://github.com/verl-project/verl)'s [`AGENTS.md`](https://github.com/verl-project/verl/blob/main/AGENTS.md), which was itself adapted from the [vLLM project](https://github.com/vllm-project/vllm).

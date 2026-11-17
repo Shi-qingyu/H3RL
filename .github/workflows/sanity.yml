@@ -1,0 +1,69 @@
+name: sanity
+
+on:
+  push:
+    branches:
+      - main
+      - v0.*
+  pull_request:
+    branches:
+      - main
+      - v0.*
+    types: [labeled]
+    paths:
+      - "**/*.py"
+      - .github/vllm_ascend_pin.txt
+      - .github/vllm_omni_pin.txt
+      - .github/verl_pin.txt
+      - .github/workflows/*.yml
+      - .readthedocs.yaml
+      - pyproject.toml
+      - "tests/special_sanity/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  sanity:
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(join(github.event.pull_request.labels.*.name, ','), 'ci')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            .github/vllm_omni_pin.txt
+            .github/verl_pin.txt
+      - name: Verify vLLM-Ascend pin
+        run: |
+          pin="$(tr -d '[:space:]' < .github/vllm_ascend_pin.txt)"
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "${tmp_dir}"' EXIT
+          git -C "${tmp_dir}" init --quiet
+          git -C "${tmp_dir}" remote add origin https://github.com/vllm-project/vllm-ascend.git
+          git -C "${tmp_dir}" fetch --quiet --depth=1 origin "${pin}"
+          test "$(git -C "${tmp_dir}" rev-parse FETCH_HEAD)" = "${pin}"
+      - name: Install the current repository
+        run: |
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu "https://github.com/vllm-project/vllm/releases/download/v0.30.0/vllm-0.30.0+cpu-cp38-abi3-manylinux_2_39_x86_64.whl"
+          pip install uv
+          uv pip install --python "$(command -v python)" -e ".[dev]"
+      - name: Run sanity test
+        run: |
+          pytest -s -x tests/special_sanity
+      - name: Assert documentation requirement for functions
+        run: python3 tests/special_sanity/validate_imported_docs.py
