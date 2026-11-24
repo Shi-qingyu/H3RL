@@ -54,10 +54,14 @@ def dedicated_reward_service(
         fd = listener.fileno()
         process = subprocess.Popen(
             [
-                str(interpreter), str(server),
-                "--fd", str(fd),
-                "--checkpoint", checkpoint,
-                "--source-root", str(source_root),
+                str(interpreter),
+                str(server),
+                "--fd",
+                str(fd),
+                "--checkpoint",
+                checkpoint,
+                "--source-root",
+                str(source_root),
             ],
             pass_fds=(fd,),
             env=_worker_env(gpu),

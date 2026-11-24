@@ -52,8 +52,15 @@ def summarize_offline_validation(run_dir: Path, outputs: list[Path]) -> None:
     baseline_step = min(by_step)
     baseline = by_step[baseline_step][1]
     config_fields = (
-        "adapter", "base_model", "data_file", "seed", "num_inference_steps", "reference_image_short_edge",
-        "attention_backend", "reward_model", "score_weights",
+        "adapter",
+        "base_model",
+        "data_file",
+        "seed",
+        "num_inference_steps",
+        "reference_image_short_edge",
+        "attention_backend",
+        "reward_model",
+        "score_weights",
     )
     baseline_scores = {}
     trend = []
