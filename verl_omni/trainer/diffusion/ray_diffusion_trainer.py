@@ -74,12 +74,14 @@ from verl_omni.trainer.diffusion.diffusion_metric_utils import (
     compute_timing_metrics_diffusion,
 )
 from verl_omni.trainer.diffusion.diffusion_trainer_utils import (
+    VALIDATION_REWARD_MEAN,
     NoOpCheckpointManager,
     _to_diffusion_worker_tensordict,
     old_policy_decay,
     skip_old_log_prob,
     track_nonfinite_grad_streak,
     validate_distillation_config,
+    validation_checkpoint_limit,
 )
 from verl_omni.trainer.diffusion.rollout_correction import (
     apply_bypass_mode_to_diffusion_batch,
@@ -88,6 +90,7 @@ from verl_omni.trainer.diffusion.rollout_correction import (
     rollout_correction_enabled,
 )
 from verl_omni.trainer.diffusion.teacher_manager import DiffusionTeacherManager
+from verl_omni.utils.checkpoint_retention import reconcile_best_checkpoints, save_if_best_checkpoint
 from verl_omni.utils.config import resolve_lora_config
 from verl_omni.utils.net_utils import worker_group_port_ranges
 from verl_omni.utils.tracking import (
@@ -887,7 +890,9 @@ class BaseRayDiffusionTrainer(ABC):
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
 
         data_sources = np.concatenate(data_source_lst, axis=0)
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        metrics = self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        metrics[VALIDATION_REWARD_MEAN] = float(np.mean(sample_scores))
+        return metrics
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
@@ -1120,13 +1125,52 @@ class BaseRayDiffusionTrainer(ABC):
         if not self.separate:
             self.checkpoint_manager.sleep_replicas()
 
-    def _save_checkpoint(self):
+    def _maybe_save_periodic_checkpoint(self, is_last_step, timing_raw):
+        trainer = self.config.trainer
+        if trainer.get("keep_best_validation_checkpoints", 0) or trainer.save_freq <= 0:
+            return
+        close_to_expiration = should_save_ckpt_esi(
+            max_steps_duration=self.max_steps_duration,
+            redundant_time=trainer.esi_redundant_time,
+        )
+        if is_last_step or self.global_steps % trainer.save_freq == 0 or close_to_expiration:
+            if close_to_expiration:
+                print("Force saving checkpoint: ESI instance expiration approaching.")
+            with marked_timer("save_checkpoint", timing_raw, color="green"):
+                self._save_checkpoint()
+
+    def _validate_and_save_checkpoint(self, timing_raw):
+        with marked_timer("testing", timing_raw, color="green"):
+            metrics = self._validate()
+        keep = self.config.trainer.get("keep_best_validation_checkpoints", 0)
+        if keep:
+            with marked_timer("save_checkpoint", timing_raw, color="green"):
+                save_if_best_checkpoint(
+                    self.config.trainer.default_local_dir,
+                    keep,
+                    self.global_steps,
+                    metrics[VALIDATION_REWARD_MEAN],
+                    self._save_validation_checkpoint,
+                )
+        return metrics
+
+    def _save_validation_checkpoint(self, local_root):
+        if self.separate:
+            self._save_checkpoint(local_root)
+            return
+        # Colocated FSDP may reload actor shards onto the GPUs to save them.
+        self.checkpoint_manager.sleep_replicas()
+        try:
+            self._save_checkpoint(local_root)
+        finally:
+            self.checkpoint_manager.update_weights(self.global_steps)
+
+    def _save_checkpoint(self, local_root=None):
         from verl.utils.fs import local_mkdir_safe
 
         # path: given_path + `/global_step_{global_steps}` + `/actor`
-        local_global_step_folder = os.path.join(
-            self.config.trainer.default_local_dir, f"global_step_{self.global_steps}"
-        )
+        root = self.config.trainer.default_local_dir if local_root is None else local_root
+        local_global_step_folder = os.path.join(root, f"global_step_{self.global_steps}")
 
         print(f"local_global_step_folder: {local_global_step_folder}")
         actor_local_path = os.path.join(local_global_step_folder, "actor")
@@ -1137,12 +1181,12 @@ class BaseRayDiffusionTrainer(ABC):
             else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "actor")
         )
 
-        remove_previous_ckpt_in_save = self.config.trainer.get("remove_previous_ckpt_in_save", False)
-        if remove_previous_ckpt_in_save:
-            print("Warning: remove_previous_ckpt_in_save is deprecated," + " set max_actor_ckpt_to_keep=1 instead")
-        max_actor_ckpt_to_keep = (
-            self.config.trainer.get("max_actor_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
-        )
+        max_actor_ckpt_to_keep = None
+        if local_root is None:
+            max_actor_ckpt_to_keep = self.config.trainer.get("max_actor_ckpt_to_keep", None)
+            if self.config.trainer.get("remove_previous_ckpt_in_save", False):
+                print("Warning: remove_previous_ckpt_in_save is deprecated, set max_actor_ckpt_to_keep=1 instead")
+                max_actor_ckpt_to_keep = 1
         self.actor_rollout_wg.save_checkpoint(
             actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
         )
@@ -1163,15 +1207,16 @@ class BaseRayDiffusionTrainer(ABC):
         ):
             print("skip write latest_checkpointed_iteration.txt when async_save is True")
             return
-        local_latest_checkpointed_iteration = os.path.join(
-            self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
-        )
+        local_latest_checkpointed_iteration = os.path.join(root, "latest_checkpointed_iteration.txt")
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
 
     def _load_checkpoint(self):
+        keep = validation_checkpoint_limit(self.config)
         if self.config.trainer.resume_mode == "disable":
             return 0
+        if keep:
+            reconcile_best_checkpoints(self.config.trainer.default_local_dir, keep)
 
         # load from hdfs
         if self.config.trainer.default_hdfs_dir is not None:
@@ -1554,27 +1599,7 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                     with marked_timer("update_actor", timing_raw, color="red"):
                         actor_output = self._update_actor(batch)
 
-                    # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
-                    esi_close_to_expiration = should_save_ckpt_esi(
-                        max_steps_duration=self.max_steps_duration,
-                        redundant_time=self.config.trainer.esi_redundant_time,
-                    )
-                    # Check if the conditions for saving a checkpoint are met.
-                    # The conditions include a mandatory condition (1) and
-                    # one of the following optional conditions (2/3/4):
-                    # 1. The save frequency is set to a positive value.
-                    # 2. It's the last training step.
-                    # 3. The current step number is a multiple of the save frequency.
-                    # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
-                    if self.config.trainer.save_freq > 0 and (
-                        is_last_step
-                        or self.global_steps % self.config.trainer.save_freq == 0
-                        or esi_close_to_expiration
-                    ):
-                        if esi_close_to_expiration:
-                            print("Force saving checkpoint: ESI instance expiration approaching.")
-                        with marked_timer("save_checkpoint", timing_raw, color="green"):
-                            self._save_checkpoint()
+                    self._maybe_save_periodic_checkpoint(is_last_step, timing_raw)
 
                     # update weights from trainer to rollout
                     with marked_timer("update_weights", timing_raw, color="red"):
@@ -1593,10 +1618,9 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                 if self.config.trainer.test_freq > 0 and (
                     is_last_step or self.global_steps % self.config.trainer.test_freq == 0
                 ):
-                    with marked_timer("testing", timing_raw, color="green"):
-                        val_metrics: dict = self._validate()
-                        if is_last_step:
-                            last_val_metrics = val_metrics
+                    val_metrics = self._validate_and_save_checkpoint(timing_raw)
+                    if is_last_step:
+                        last_val_metrics = val_metrics
                     metrics.update(val_metrics)
 
                 with marked_timer("stop_profile", timing_raw):
@@ -1963,27 +1987,7 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
                             if self._has_old_adapter:
                                 metrics.update(compute_old_policy_metrics(self._update_old_policy()))
 
-                    # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
-                    esi_close_to_expiration = should_save_ckpt_esi(
-                        max_steps_duration=self.max_steps_duration,
-                        redundant_time=self.config.trainer.esi_redundant_time,
-                    )
-                    # Check if the conditions for saving a checkpoint are met.
-                    # The conditions include a mandatory condition (1) and
-                    # one of the following optional conditions (2/3/4):
-                    # 1. The save frequency is set to a positive value.
-                    # 2. It's the last training step.
-                    # 3. The current step number is a multiple of the save frequency.
-                    # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
-                    if self.config.trainer.save_freq > 0 and (
-                        is_last_step
-                        or self.global_steps % self.config.trainer.save_freq == 0
-                        or esi_close_to_expiration
-                    ):
-                        if esi_close_to_expiration:
-                            print("Force saving checkpoint: ESI instance expiration approaching.")
-                        with marked_timer("save_checkpoint", timing_raw, color="green"):
-                            self._save_checkpoint()
+                    self._maybe_save_periodic_checkpoint(is_last_step, timing_raw)
 
                     # update weights from trainer to rollout
                     with marked_timer("update_weights", timing_raw, color="red"):
@@ -2007,10 +2011,9 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
                 if self.config.trainer.test_freq > 0 and (
                     is_last_step or self.global_steps % self.config.trainer.test_freq == 0
                 ):
-                    with marked_timer("testing", timing_raw, color="green"):
-                        val_metrics: dict = self._validate()
-                        if is_last_step:
-                            last_val_metrics = val_metrics
+                    val_metrics = self._validate_and_save_checkpoint(timing_raw)
+                    if is_last_step:
+                        last_val_metrics = val_metrics
                     metrics.update(val_metrics)
 
                 with marked_timer("stop_profile", timing_raw):

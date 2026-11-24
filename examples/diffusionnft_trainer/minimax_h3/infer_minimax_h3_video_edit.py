@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Preview H3's SFT policy on prepared V6 training prompts without starting RL.
+"""Preview the H3 SFT policy or score an exported RL policy on prepared V6 validation rows.
 
 Uses vLLM-Omni's MiniMaxH3Pipeline and the same LoRA mapping as the NFT rollout.
 For 24 FPS sources, export exactly the source frame count after removing the
@@ -20,8 +20,15 @@ Run through run_minimax_h3_video_edit_infer.sh from an H3 training environment.
 """
 
 import argparse
+import asyncio
+import hashlib
 import json
+import math
+import os
 import shutil
+import tempfile
+from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -40,6 +47,7 @@ from vllm_omni.model_executor.models.minimax_h3.encoder_processing import MINIMA
 from vllm_omni.model_executor.models.minimax_h3.reference_video import _probe_video
 
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
+    MINIMAX_H3_TOKEN_ID_NATIVE_KEY,
     MiniMaxH3RolloutWeightSyncMixin,
     minimax_h3_short_video_requests,
     ref2va_reference_image_short_edge,
@@ -49,7 +57,7 @@ from verl_omni.utils.tracking import _export_video
 
 
 class H3SFTInferencePipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pipeline):
-    """Load the converted SFT adapter into H3's native inference projections."""
+    """Load converted H3 LoRA factors into the native inference projections."""
 
     def __init__(self, *, od_config, prefix: str = "") -> None:
         super().__init__(od_config=od_config, prefix=prefix)
@@ -58,8 +66,10 @@ class H3SFTInferencePipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pipeline)
     def _load_diffusion_lora_adapter(self, *, lora_request, lora_path, dtype):
         adapter_dir = Path(lora_path)
         manifest = json.loads((adapter_dir / "conversion_manifest.json").read_text())
-        if manifest.get("format") != "minimax_h3_sft_lora" or manifest.get("base_weights_merged") is not False:
-            raise ValueError("Use the separate SFT adapter produced by prepare_video_edit_sft_lora.py.")
+        if manifest.get("format") not in {"minimax_h3_sft_lora", "minimax_h3_rl_lora"}:
+            raise ValueError("Expected a converted H3 SFT or exported RL adapter.")
+        if manifest.get("base_weights_merged") is not False:
+            raise ValueError("The LoRA must be separate from the official H3 base.")
         config = json.loads((adapter_dir / "adapter_config.json").read_text())
         tensors = load_file(str(adapter_dir / "pytorch_lora_weights.safetensors"), device="cpu")
         tensors, config = self.map_lora_update_to_engine(tensors, config)
@@ -77,12 +87,26 @@ class H3SFTInferencePipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pipeline)
     def _validate_diffusion_lora_binding(self, *, lora_model, bound_lora_names) -> None:
         missing = set(lora_model.loras) - bound_lora_names
         if missing:
-            raise ValueError(f"SFT adapter has unbound projections: {sorted(missing)[:8]}")
+            raise ValueError(f"H3 adapter has unbound projections: {sorted(missing)[:8]}")
 
     def _prepare_request_inputs(self, raw_prompt, sampling):
         short_edge = sampling.extra_args["reference_image_short_edge"]
         with ref2va_reference_image_short_edge(short_edge), minimax_h3_short_video_requests():
             return super()._prepare_request_inputs(raw_prompt, sampling)
+
+    def _encode_local_media(self, media):
+        if media is not None and media.videos:
+            processor = self.video_vae.model.processor
+            min_frames = 1 + processor.align_video_length(1, mode="pad", granularity="chunk")
+            videos = []
+            for frames in media.videos:
+                if 0 < len(frames) < min_frames:
+                    # Only the VAE reference needs a complete first chunk.
+                    tail = frames[-1:].expand(min_frames - len(frames), -1, -1, -1)
+                    frames = torch.cat((frames, tail))
+                videos.append(frames)
+            media = replace(media, videos=tuple(videos))
+        return super()._encode_local_media(media)
 
     def forward(self, request):
         """Return decoded media without collecting RL training tensors."""
@@ -94,29 +118,92 @@ class H3SFTInferencePipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pipeline)
                     module._set_diffusion_lora_buffer_device(self.device)
         self._ensure_prompt_text(request)
         try:
-            return super().forward(request)
+            extra = request.sampling_params.extra_args
+            context = (
+                ref2va_reference_image_short_edge(extra["reference_image_short_edge"])
+                if extra.get(MINIMAX_H3_TOKEN_ID_NATIVE_KEY)
+                else nullcontext()
+            )
+            with context:
+                return super().forward(request)
         finally:
             self._h3_prompt_ids = None
 
 
+def _validation_indices(value: str) -> list[int]:
+    try:
+        indices = [int(item) for item in value.split(",")]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Expected a comma-separated list of integer validation row indices.") from exc
+    if len(set(indices)) != len(indices) or min(indices) < 0:
+        raise argparse.ArgumentTypeError("Validation row indices must be unique and nonnegative.")
+    return indices
+
+
+def _archive_validation_source(source: Path, source_dir: Path) -> Path:
+    stat = source.stat()
+    identity = f"{source}\0{stat.st_size}\0{stat.st_mtime_ns}"
+    name = hashlib.sha256(os.fsencode(identity)).hexdigest() + source.suffix
+    saved = source_dir / name
+    if not saved.is_file():
+        # Publish a complete copy even when two replicas select the same source.
+        with tempfile.TemporaryDirectory(dir=source_dir) as work:
+            pending = Path(work) / name
+            shutil.copyfile(source, pending)
+            pending.replace(saved)
+    return saved
+
+
+async def _score_validation(frames: np.ndarray, info: dict, fps: float, url: str, weights: list[float]) -> dict:
+    from verl_omni.utils.reward_score.video_edit_reward import compute_score
+
+    try:
+        return await compute_score(
+            solution_image=torch.from_numpy(frames).permute(0, 3, 1, 2),
+            extra_info={**info, "media_kind": "video", "fps": fps},
+            server_url=url,
+            fps=fps,
+            score_weights=weights,
+        )
+    finally:
+        session = getattr(compute_score, "_session", None)
+        if session is not None and not session.closed:
+            await session.close()
+
+
 def main() -> None:
-    """Generate selected training rows and save videos with their source metadata."""
+    """Generate prepared V6 rows and optionally score checkpoint validation outputs."""
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--model-path", type=Path, required=True, help="Official H3 root containing Ref2VA/.")
-    parser.add_argument("--lora-path", type=Path, help="Converted SFT adapter; required unless --base-only.")
+    parser.add_argument("--lora-path", type=Path, help="Converted SFT or exported RL adapter.")
     parser.add_argument("--base-only", action="store_true", help="Preview the official base without SFT LoRA.")
     parser.add_argument("--data-file", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, required=True, help="New directory for this preview run.")
+    parser.add_argument("--output-dir", type=Path, required=True, help="Directory for this preview or GPU group.")
     parser.add_argument("--num-samples", type=int, default=8, help="Number of consecutive rows; 0 means all remaining.")
     parser.add_argument("--start-index", type=int, default=0)
+    parser.add_argument("--validation-indices", type=_validation_indices, help="Comma-separated held-out row indices.")
+    parser.add_argument("--validation-source-dir", type=Path, help="Shared directory for validation input videos.")
+    parser.add_argument("--reward-url", help="VideoReward /score endpoint for offline validation.")
+    parser.add_argument("--score-weights", type=float, nargs=3, default=[1.0, 1.0, 1.0], metavar=("IF", "SF", "VQ"))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-inference-steps", type=int, default=40)
     parser.add_argument("--tensor-parallel-size", type=int, default=2)
     parser.add_argument("--text-encoder-tp-size", type=int, default=2)
     parser.add_argument("--reference-image-short-edge", type=int, default=2048)
-    parser.add_argument("--attention-backend", default="FLASH_ATTN_3_HUB")
+    parser.add_argument("--attention-backend")
     parser.add_argument("--ffmpeg", default="ffmpeg", help="FFmpeg executable name or path for saving MP4 videos.")
     args = parser.parse_args()
+    validate = args.validation_indices is not None
+    if validate != bool(args.reward_url):
+        parser.error("Use --validation-indices and --reward-url together.")
+    if args.validation_source_dir is not None and not validate:
+        parser.error("--validation-source-dir requires --validation-indices.")
+    if validate and (args.base_only or args.lora_path is None):
+        parser.error("Offline validation requires --lora-path pointing to an exported RL adapter.")
+    if any(not math.isfinite(w) or w < 0 for w in args.score_weights) or not 0 < sum(args.score_weights) < math.inf:
+        parser.error("--score-weights must be finite, nonnegative and have a positive finite sum.")
+    if args.attention_backend is None:
+        args.attention_backend = "TORCH_SDPA" if validate else "FLASH_ATTN_3_HUB"
     ffmpeg_exe = shutil.which(args.ffmpeg)
     if ffmpeg_exe is None:
         parser.error("FFmpeg is unavailable; add it to PATH or pass --ffmpeg /path/to/ffmpeg.")
@@ -141,32 +228,56 @@ def main() -> None:
     if lora_path is not None:
         adapter_manifest = json.loads((lora_path / "conversion_manifest.json").read_text())
         if Path(adapter_manifest["base_model"]).resolve() != model_path:
-            raise ValueError("The converted SFT adapter was prepared for a different H3 base.")
+            raise ValueError("The adapter was prepared for a different H3 base.")
+        if validate and adapter_manifest.get("format") != "minimax_h3_rl_lora":
+            raise ValueError("Offline checkpoint validation requires an exported RL adapter.")
+        if validate and (
+            adapter_manifest.get("adapter") not in {"default", "old"}
+            or type(adapter_manifest.get("step")) is not int
+            or adapter_manifest["step"] < 0
+        ):
+            raise ValueError("The RL adapter manifest must identify its checkpoint step and policy.")
     data_manifest = json.loads((data_file.parent / "conversion_manifest.json").read_text())
     if data_manifest.get("format") != "video_edit_v6":
         raise ValueError("Use the parquet dataset produced by prepare_video_edit_v6_data.py.")
     table = pq.read_table(data_file, columns=["prompt", "videos", "extra_info"])
-    count = min(args.num_samples or table.num_rows, table.num_rows - args.start_index)
-    if count <= 0:
+    indices = (
+        args.validation_indices
+        if validate
+        else range(args.start_index, min(table.num_rows, args.start_index + (args.num_samples or table.num_rows)))
+    )
+    count = len(indices)
+    if not count:
         raise ValueError(f"No samples at start index {args.start_index}; dataset has {table.num_rows} rows.")
-    rows = table.slice(args.start_index, count).to_pylist()
+    if max(indices) >= table.num_rows:
+        raise ValueError(f"Row {max(indices)} exceeds the dataset size ({table.num_rows}).")
+    rows = table.take(list(indices)).to_pylist()
 
     output_dir.mkdir(parents=True, exist_ok=False)
     (output_dir / "videos").mkdir()
-    (output_dir / "sources").mkdir()
+    if validate:
+        from transformers import AutoTokenizer
+
+        source_dir = (args.validation_source_dir or output_dir / "sources").expanduser().resolve()
+        source_dir.mkdir(parents=True, exist_ok=True)
+        tokenizer = AutoTokenizer.from_pretrained(str(model_path / "Ref2VA" / "tokenizer"), local_files_only=True)
+        os.environ.setdefault("VLLM_OMNI_DLO_DP_WAVE_TIMEOUT", "10800")
+        os.environ.setdefault("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", "3600")
+    else:
+        (output_dir / "sources").mkdir()
     settings = {
         **{key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         "model_path": str(model_path),
         "lora_path": str(lora_path) if lora_path else None,
         "data_file": str(data_file),
         "output_dir": str(output_dir),
-        "timing_policy": "source frame count at 24 FPS; align to 17n+5 and trim only the alignment tail",
-        "canvas_policy": "per-row V6 source_height/source_width",
+        "timing_policy": "full V6 rollout_shape" if validate else "align source to 17n+5 and trim the alignment tail",
+        "canvas_policy": "per-row V6 rollout_shape" if validate else "per-row V6 source_height/source_width",
         "minimum_generation_request_frames": 1,
         "selected_samples": count,
     }
     (output_dir / "run_config.json").write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n")
-    lora_request = LoRARequest("h3-sft-v6", 1, str(lora_path)) if lora_path else None
+    lora_request = LoRARequest("h3-rl-v6" if validate else "h3-sft-v6", 1, str(lora_path)) if lora_path else None
     print(f"Generating {count} samples into {output_dir}", flush=True)
     engine = Omni(
         model=str(model_path / "Ref2VA"),
@@ -184,7 +295,11 @@ def main() -> None:
             ),
         },
         max_num_seqs=1,
-        enable_layerwise_offload=True,
+        **(
+            {"diffusion_offload_config": {"mode": "layer", "components": ["dit", "text_encoder"], "pin_memory": False}}
+            if validate
+            else {"enable_layerwise_offload": True}
+        ),
         diffusion_attention_backend=args.attention_backend,
         step_execution=False,
         max_cpu_loras=1,
@@ -192,9 +307,8 @@ def main() -> None:
         stage_init_timeout=1800,
     )
     try:
-        with (output_dir / "samples.jsonl").open("w", encoding="utf-8") as manifest:
-            for offset, row in enumerate(rows):
-                index = args.start_index + offset
+        with nullcontext() if validate else (output_dir / "samples.jsonl").open("w", encoding="utf-8") as manifest:
+            for offset, (index, row) in enumerate(zip(indices, rows, strict=True)):
                 info = row["extra_info"]
                 messages = row["prompt"]
                 if len(messages) != 1 or messages[0]["role"] != "user":
@@ -212,29 +326,46 @@ def main() -> None:
                 start_time = references[0].get("start_time_seconds") or 0.0
                 if start_time != 0.0:
                     raise ValueError("Source-length previews require the complete source video without an offset.")
-                source_metadata = _probe_video(str(source))
-                fps = source_metadata["fps"]
+                if validate:
+                    shape = info["rollout_shape"]
+                    requested_frames = shape["num_frames"]
+                    height, width, fps = shape["height"], shape["width"], shape["frame_rate"]
+                    if (
+                        requested_frames % 17 != 5
+                        or height % 32
+                        or width % 32
+                        or min(requested_frames, height, width) < 1
+                    ):
+                        raise ValueError(f"Row {index} has invalid H3 rollout shape: {shape}")
+                else:
+                    source_metadata = _probe_video(str(source))
+                    fps = source_metadata["fps"]
+                    source_frames = source_metadata["frame_count"]
+                    if source_frames <= 0:
+                        raise ValueError(f"Row {index} source video has no frames.")
+                    requested_frames = source_frames
+                    height, width = info["source_height"], info["source_width"]
                 if fps != MINIMAX_H3_FPS:
-                    raise ValueError(
-                        f"Row {index} has {fps} FPS; this H3 preview supports 24 FPS sources without resampling."
-                    )
-                source_frames = source_metadata["frame_count"]
-                if source_frames <= 0:
-                    raise ValueError(f"Row {index} source video has no frames.")
-                requested_frames = source_frames
+                    raise ValueError(f"Row {index} has {fps} FPS; prepared V6 videos require 24 FPS.")
                 generation_frames = minimax_h3_align_frame_count(requested_frames)
-                print(
-                    f"Row {index}: source={source_frames} frames at {fps:g} FPS; "
-                    f"generate={generation_frames}, save={source_frames}",
-                    flush=True,
-                )
-                seed = args.seed + index
+                print(f"Row {index}: generating {generation_frames} frames at {fps:g} FPS", flush=True)
+                seed = args.seed if validate else args.seed + index
+                engine_prompt = {
+                    "prompt": prompt,
+                    "multi_modal_data": {"video": [{"path": str(source), "start_time_seconds": start_time}]},
+                }
+                if validate:
+                    engine_prompt["prompt_ids"] = tokenizer(
+                        prompt.strip(), add_special_tokens=False, truncation=True, max_length=12288
+                    )["input_ids"]
+                    if references[0].get("start_time_seconds") is None:
+                        engine_prompt["multi_modal_data"] = {"video": [str(source)]}
                 sampling = OmniDiffusionSamplingParams(
                     seed=seed,
                     num_outputs_per_prompt=1,
                     num_inference_steps=args.num_inference_steps,
-                    height=int(info["source_height"]),
-                    width=int(info["source_width"]),
+                    height=height,
+                    width=width,
                     num_frames=requested_frames,
                     fps=fps,
                     frame_rate=fps,
@@ -250,13 +381,11 @@ def main() -> None:
                         "duration_seconds": requested_frames / fps,
                         "video_flow_shift": 12.0,
                         "reference_image_short_edge": args.reference_image_short_edge,
+                        **({MINIMAX_H3_TOKEN_ID_NATIVE_KEY: True} if validate else {}),
                     },
                 )
                 results = engine.generate(
-                    {
-                        "prompt": prompt,
-                        "multi_modal_data": {"video": [{"path": str(source), "start_time_seconds": start_time}]},
-                    },
+                    engine_prompt,
                     sampling_params_list=[sampling],
                     use_tqdm=False,
                 )
@@ -271,8 +400,11 @@ def main() -> None:
                     raise RuntimeError(f"Expected RGB video, got {frames.shape}.")
                 if frames.shape[0] != generation_frames:
                     raise RuntimeError(f"Expected {generation_frames} generated frames, got {frames.shape[0]}.")
-                # Retain the original timeline; remove only the extra generated tail.
-                frames = frames[:source_frames]
+                if validate and frames.shape[1:3] != (height, width):
+                    raise RuntimeError(f"Row {index} returned {frames.shape[1:3]} instead of {(height, width)}.")
+                if not validate:
+                    # Preview only the source timeline. Score the full decoded validation rollout.
+                    frames = frames[:source_frames]
                 name = f"{index:06d}"
                 generated = output_dir / "videos" / f"{name}.mp4"
                 _export_video(
@@ -281,8 +413,6 @@ def main() -> None:
                     fps=int(fps),
                     ffmpeg_exe=ffmpeg_exe,
                 )
-                source_link = output_dir / "sources" / f"{name}{source.suffix}"
-                source_link.symlink_to(source)
                 record = {
                     "row_index": index,
                     "sample_id": info["sample_id"],
@@ -290,23 +420,45 @@ def main() -> None:
                     "edit_instruction": info["edit_instruction"],
                     "instruction_task": info["instruction_task"],
                     "source_video": str(source),
-                    "source_preview": str(source_link.relative_to(output_dir)),
                     "generated_video": str(generated.relative_to(output_dir)),
                     "seed": seed,
-                    "source_num_frames": source_frames,
-                    "source_duration_seconds": source_frames / fps,
                     "generation_request_frames": requested_frames,
                     "generated_num_frames": generation_frames,
-                    "trimmed_tail_frames": generation_frames - source_frames,
+                    "trimmed_tail_frames": generation_frames - len(frames),
                     "sft_padded_num_frames": info["num_frames"],
                     "output_shape": list(frames.shape),
                     "fps": fps,
                 }
-                manifest.write(json.dumps(record, ensure_ascii=False) + "\n")
-                manifest.flush()
-                (output_dir / "videos" / f"{name}.json").write_text(
-                    json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-                )
+                if validate:
+                    archived = _archive_validation_source(source, source_dir)
+                    scores = asyncio.run(_score_validation(frames, info, fps, args.reward_url, args.score_weights))
+                    record.update(
+                        uid=info["sample_id"],
+                        source_preview=os.path.relpath(archived, output_dir),
+                        rollout_shape=shape,
+                        num_inference_steps=args.num_inference_steps,
+                        adapter_name=adapter_manifest["adapter"],
+                        step=adapter_manifest["step"],
+                        **scores,
+                    )
+                else:
+                    source_link = output_dir / "sources" / f"{name}{source.suffix}"
+                    source_link.symlink_to(source)
+                    record.update(
+                        source_preview=str(source_link.relative_to(output_dir)),
+                        source_num_frames=source_frames,
+                        source_duration_seconds=source_frames / fps,
+                    )
+                    manifest.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    manifest.flush()
+                serialized = json.dumps(record, allow_nan=False, ensure_ascii=False, indent=2) + "\n"
+                generated.with_suffix(".json").write_text(serialized, encoding="utf-8")
+                if validate:
+                    row_path = output_dir / f"row_{index}.json"
+                    pending = row_path.with_suffix(".json.tmp")
+                    pending.write_text(serialized, encoding="utf-8")
+                    pending.replace(row_path)
+                    print(f"[{offset + 1}/{count}] Scored {row_path}: {scores}", flush=True)
                 print(f"[{offset + 1}/{count}] Saved {generated}", flush=True)
     finally:
         engine.close()

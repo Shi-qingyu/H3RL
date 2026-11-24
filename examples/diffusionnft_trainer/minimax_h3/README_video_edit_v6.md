@@ -107,8 +107,8 @@ Each row carries its native `rollout_shape` (frames, height, width, 24 FPS).
 `VideoEditShapeSampler` shuffles batches grouped by this shape, so all rollout
 workers and actor ranks receive compatible tensors within a global prompt batch.
 Each bucket's final batch repeats samples to fill the batch, without discarding
-sources. The sampler saves its epoch and cursor for checkpoint resume. Validation
-uses one source per batch and exports individual named previews without stacking
+sources. The sampler saves its epoch and cursor for checkpoint resume. When enabled,
+validation uses one source per batch and exports individual named previews without stacking
 different video shapes. `NUM_FRAMES`, `HEIGHT`, and `WIDTH` only supply initial
 engine defaults; each row overrides them with its own rollout shape.
 
@@ -169,7 +169,6 @@ bash examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_video_edit_v6_lora.
     +ray_kwargs.ray_init.address=local \
     +ray_kwargs.ray_init.num_gpus=6 \
     'trainer.logger=[console]' \
-    trainer.test_freq=10 \
     trainer.val_before_train=False \
     data.val_max_samples=4 \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
@@ -192,14 +191,11 @@ the checkpoint's custom VAE code. The installed Diffusers `AutoModel` rejects
 `trust_remote_code=True` when the transformer config has no `auto_map`; do not
 override the actor setting to `True` in the launch command.
 
-This example reserves physical GPUs 0–5 for training; run the reward service
-separately on physical GPU 6, with GPU 7 available. Validation runs every ten
-training steps and saves up to four generated videos locally. The output for
-step 10 is `$OUTPUT_DIR/validation_data/10/<index>.mp4`, with prompts, editing
-instructions and reward scores in `$OUTPUT_DIR/validation_data/10.jsonl`.
-Subsequent validations use directories and JSONL files named `20`, `30`, and so on.
-Setting `trainer.log_val_generations=0` skips logger sample tables; local video
-and JSONL exports remain enabled through `trainer.validation_data_dir`.
+This example reserves physical GPUs 0–5 for training and runs the reward service
+on physical GPU 6, with GPU 7 available. The V6 launcher skips validation by default.
+Every five training steps, it exports training samples under `$OUTPUT_DIR/rollout_data/`
+and saves a checkpoint under `$OUTPUT_DIR/checkpoints/global_step_<step>/`.
+It keeps every checkpoint. Auto-resume uses the latest saved step.
 
 `RAY_NUM_CPUS` defaults to 32. The six-GPU training resource group requests 18
 CPUs (three per GPU), with additional CPU resources needed for the controller and
@@ -265,3 +261,35 @@ The default training output is `$V6_OUTPUT_DIR/training_sft_lora`, separate from
 the previous fused-base run directory.
 
 The adapter conversion and training changes have not been executed or tested.
+
+## Validate a saved RL checkpoint on a separate six-GPU node
+
+Run the following from the repository root on the evaluation node. The example uses
+three local TP=2 replicas on GPUs 1–6. The existing VideoReward service runs on its
+own GPU, can read the source videos on the shared filesystem, and provides the
+`/health` and `/score` endpoints. Set `RUN_DIR` to the training run and `STEP` to a
+completed save. The checkpoint, prepared dataset and base model must be readable on this node.
+
+```bash
+STEP=5
+bash examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_video_edit_v6_validation.sh \
+    "$RUN_DIR/checkpoints/global_step_$STEP" \
+    --gpus 1,2,3,4,5,6 --reward-url http://127.0.0.1:19085/score
+```
+
+The evaluator reads only the selected RL adapter from the model shards and uses
+the layout metadata of the prepared SFT adapter. It evaluates `default` (the
+updated actor) by default. Pass `--adapter old` to evaluate the rollout policy used by
+in-training validation. Both use the official H3 base. No training Ray cluster is required.
+
+The default uses the same four held-out rows as the 24-GPU recipe, seed 42, native
+per-row shapes, one video per row, and 40 denoising steps. Use `--num-samples 0`
+to evaluate the full test split. Each generated video is scored from its decoded
+frames using the same three-head VideoReward client as training. The evaluator
+assigns each row to one replica and averages the per-video scores with equal weight.
+
+Every invocation prints its new directory under `$RUN_DIR/offline_validation/`.
+`run_config.json` records the selected rows, GPU assignments and reward checkpoint.
+`group_0.log` through `group_2.log` show live progress. The group directories contain
+the saved videos and individual scores. A completed run publishes `summary.json`
+with `val-aggregate/reward/mean`, the three dimension means, and links to each row's result.

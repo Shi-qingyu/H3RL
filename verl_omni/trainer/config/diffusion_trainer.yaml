@@ -219,6 +219,9 @@ trainer:
   # Maximum number of actor checkpoints to keep
   max_actor_ckpt_to_keep: null
 
+  # Keep the top K local checkpoints by mean validation reward; 0 uses the periodic save policy.
+  keep_best_validation_checkpoints: 0
+
   # Timeout (in seconds) for Ray worker to wait for registration
   ray_wait_register_center_timeout: 300
 

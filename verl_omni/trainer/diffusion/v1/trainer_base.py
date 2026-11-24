@@ -75,10 +75,12 @@ from verl_omni.trainer.diffusion.diffusion_metric_utils import (
     compute_timing_metrics_diffusion,
 )
 from verl_omni.trainer.diffusion.diffusion_trainer_utils import (
+    VALIDATION_REWARD_MEAN,
     old_policy_decay,
     skip_old_log_prob,
     track_nonfinite_grad_streak,
     validate_distillation_config,
+    validation_checkpoint_limit,
 )
 from verl_omni.trainer.diffusion.ray_diffusion_trainer import (
     BaseRayDiffusionTrainer,
@@ -104,6 +106,7 @@ from verl_omni.trainer.diffusion.v1.tq_utils import (
     put_dataproto_fields_to_tq,
     sort_diffusion_tq_keys,
 )
+from verl_omni.utils.checkpoint_retention import reconcile_best_checkpoints, save_if_best_checkpoint
 from verl_omni.utils.config import resolve_lora_config
 from verl_omni.utils.net_utils import worker_group_port_ranges
 from verl_omni.utils.tracking import batch_items, validate_audio_batch
@@ -388,6 +391,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
         self.on_train_begin()
         last_val_metrics = None
+        keep_best = self.config.trainer.get("keep_best_validation_checkpoints", 0)
         while current_epoch < self.config.trainer.total_epochs and self.global_steps <= self.total_training_steps:
             is_last_step = self.global_steps >= self.total_training_steps
             metrics: dict = {}
@@ -397,8 +401,10 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 self._start_profiling()
                 batch = self.step(metrics, self.timing_raw)
                 self._stop_profiling()
-                if self.config.trainer.save_freq > 0 and (
-                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0
+                if (
+                    not keep_best
+                    and self.config.trainer.save_freq > 0
+                    and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0)
                 ):
                     with marked_timer("save_checkpoint", self.timing_raw, color="green"):
                         self._save_checkpoint()
@@ -415,6 +421,15 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                     if is_last_step:
                         last_val_metrics = val_metrics
                 metrics.update(val_metrics)
+                if keep_best:
+                    with marked_timer("save_checkpoint", self.timing_raw, color="green"):
+                        save_if_best_checkpoint(
+                            self.config.trainer.default_local_dir,
+                            keep_best,
+                            self.global_steps,
+                            val_metrics[VALIDATION_REWARD_MEAN],
+                            self._save_validation_checkpoint,
+                        )
 
             self._compute_metrics(batch, metrics, self.timing_raw, self.global_steps, current_epoch)
 
@@ -1645,7 +1660,10 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             )
 
         data_sources_arr = np.concatenate(data_sources, axis=0) if data_sources else np.array([])
-        return self._val_metrics_update(data_sources_arr, sample_uids, reward_extra_infos_dict, sample_turns)
+        metrics = self._val_metrics_update(data_sources_arr, sample_uids, reward_extra_infos_dict, sample_turns)
+        if sample_scores or self.config.trainer.get("keep_best_validation_checkpoints", 0):
+            metrics[VALIDATION_REWARD_MEAN] = float(np.mean(sample_scores)) if sample_scores else float("nan")
+        return metrics
 
     def _maybe_log_val_generations(
         self,
@@ -1913,12 +1931,26 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 }
             )
 
-    def _save_checkpoint(self):
+    def _save_validation_checkpoint(self, local_root):
+        # Validation leaves rollout resident on the actor GPUs. Async hybrid
+        # replicas also have to leave the balancer before yielding that memory.
+        if self.trainer_mode == "sync":
+            self.checkpoint_manager.sleep_replicas()
+        else:
+            self.switch_to_trainer()
+        try:
+            self._save_checkpoint(local_root)
+        finally:
+            if self.trainer_mode == "sync":
+                self.checkpoint_manager.update_weights(self.global_steps)
+            else:
+                self.switch_to_rollout()
+
+    def _save_checkpoint(self, local_root=None):
         from verl.utils.fs import local_mkdir_safe
 
-        local_global_step_folder = os.path.join(
-            self.config.trainer.default_local_dir, f"global_step_{self.global_steps}"
-        )
+        checkpoint_root = self.config.trainer.default_local_dir if local_root is None else local_root
+        local_global_step_folder = os.path.join(checkpoint_root, f"global_step_{self.global_steps}")
         logger.info(f"Saving diffusion checkpoint to {local_global_step_folder}")
         actor_local_path = os.path.join(local_global_step_folder, "actor")
         actor_remote_path = (
@@ -1926,7 +1958,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             if self.config.trainer.default_hdfs_dir is None
             else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "actor")
         )
-        max_actor_ckpt_to_keep = self.config.trainer.get("max_actor_ckpt_to_keep", None)
+        max_actor_ckpt_to_keep = self.config.trainer.get("max_actor_ckpt_to_keep", None) if local_root is None else None
         self.actor_rollout_wg.save_checkpoint(
             actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
         )
@@ -1940,14 +1972,17 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 metadata={"global_steps": self.global_steps},
             )
 
-        latest = os.path.join(self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt")
+        latest = os.path.join(checkpoint_root, "latest_checkpointed_iteration.txt")
         with open(latest, "w") as f:
             f.write(str(self.global_steps))
 
     def _load_checkpoint(self):
         self.global_steps = 0
+        keep_best = validation_checkpoint_limit(self.config)
         if self.config.trainer.resume_mode == "disable":
             return
+        if keep_best:
+            reconcile_best_checkpoints(self.config.trainer.default_local_dir, keep_best)
         if self.config.trainer.resume_mode == "auto":
             checkpoint_folder = self.config.trainer.default_local_dir
             if not os.path.isabs(checkpoint_folder):

@@ -19,6 +19,26 @@ from typing import Any, Optional
 from verl import DataProto
 from verl.trainer.distillation import is_distillation_enabled
 
+VALIDATION_REWARD_MEAN = "val-aggregate/reward/mean"
+
+
+def validation_checkpoint_limit(config) -> int:
+    """Return the number of ranked local checkpoints to keep after validation."""
+    keep = config.trainer.get("keep_best_validation_checkpoints", 0)
+    if type(keep) is not int or keep < 0:
+        raise ValueError("trainer.keep_best_validation_checkpoints must be a nonnegative integer")
+    if keep:
+        if config.trainer.test_freq <= 0:
+            raise ValueError("Ranked checkpoints require trainer.test_freq > 0")
+        if config.algorithm.sample_source == "offline":
+            raise ValueError("Ranked checkpoints require online validation rollouts to compute rewards")
+        if config.trainer.get("default_hdfs_dir") or config.actor_rollout_ref.actor.checkpoint.get("async_save", False):
+            raise ValueError("Ranked checkpoints require synchronous saves to trainer.default_local_dir")
+        if config.trainer.get("del_local_ckpt_after_load", False):
+            raise ValueError("Ranked checkpoints require trainer.del_local_ckpt_after_load=false")
+    return keep
+
+
 # ``rollout_media.ARTIFACT_PREFIX``, spelled literally to keep this core
 # trainer module free of the pipeline package's import graph.
 MEDIA_ARTIFACT_FIELD_PREFIX = "media_artifact__"

@@ -7,6 +7,10 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/../../.." && pwd)
 cd -- "$REPO_ROOT"
 source "$SCRIPT_DIR/video_edit_v6.env"
 
+export INFER_STEPS=${INFER_STEPS:-20}
+# A 40-step validation forward on a native 124-frame video can exceed one hour.
+export VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=${VLLM_OMNI_DLO_DP_WAVE_TIMEOUT:-10800}
+export VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT=${VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT:-3600}
 export OUTPUT_DIR=${OUTPUT_DIR:-$V6_OUTPUT_DIR/training_sft_lora}
 export WANDB_RUN_ID=${WANDB_RUN_ID:-minimax_h3_video_edit_v6_sft_lora}
 export PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}
@@ -145,6 +149,7 @@ case ${H3_AUTO_DIAGNOSTICS:-1} in
 esac
 
 bash "$SCRIPT_DIR/run_minimax_h3_video_edit_lora.sh" \
+    algorithm.timestep_fraction=0.5 \
     actor_rollout_ref.model.trust_remote_code=False \
     '+actor_rollout_ref.rollout.engine_kwargs.vllm_omni.trust_remote_code=True' \
     "actor_rollout_ref.model.lora_rank=$sft_lora_rank" \
@@ -161,6 +166,12 @@ bash "$SCRIPT_DIR/run_minimax_h3_video_edit_lora.sh" \
     '+data.sampler.class_name=VideoEditShapeSampler' \
     data.val_batch_size=1 \
     trainer.experiment_name=minimax_h3_video_edit_v6_sft_lora \
+    trainer.rollout_data_save_freq=5 \
+    trainer.val_before_train=False \
+    trainer.test_freq=-1 \
+    trainer.save_freq=5 \
+    trainer.keep_best_validation_checkpoints=0 \
+    trainer.max_actor_ckpt_to_keep=null \
     trainer.log_val_generations=0 \
     'trainer.logger=[console]' \
     "${diagnostic_args[@]}" \

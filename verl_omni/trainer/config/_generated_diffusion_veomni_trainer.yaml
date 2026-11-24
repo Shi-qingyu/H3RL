@@ -710,6 +710,7 @@ trainer:
   del_local_ckpt_after_load: false
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
   max_actor_ckpt_to_keep: null
+  keep_best_validation_checkpoints: 0
   ray_wait_register_center_timeout: 300
   ray_master_port_range: null
   device: cuda

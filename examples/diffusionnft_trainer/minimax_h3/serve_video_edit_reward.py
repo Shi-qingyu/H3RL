@@ -24,6 +24,7 @@ import json
 import logging
 import math
 import os
+import socket
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -321,6 +322,7 @@ def main():
     parser.add_argument("--attn-impl", choices=("flash_attn", "sdpa", "eager"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=19085)
+    parser.add_argument("--fd", type=int, help="Serve on a TCP socket already bound by the local launcher.")
     parser.add_argument("--max-request-bytes", type=int, default=512 * 1024 * 1024)
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
@@ -339,7 +341,11 @@ def main():
         attn_impl=args.attn_impl,
         max_request_bytes=args.max_request_bytes,
     )
-    uvicorn.run(app, host=args.host, port=args.port, workers=1)
+    if args.fd is None:
+        uvicorn.run(app, host=args.host, port=args.port, workers=1)
+    else:
+        with socket.socket(fileno=args.fd) as listener:
+            uvicorn.Server(uvicorn.Config(app)).run(sockets=[listener])
 
 
 if __name__ == "__main__":
