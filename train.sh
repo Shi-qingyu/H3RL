@@ -22,7 +22,7 @@ export ACTOR_ATTN_BACKEND=native
 export ROLLOUT_ATTN_BACKEND=TORCH_SDPA
 export FFBIN="$OLD/diagnostics/rollout-20261120-112626-vJfc1J/bin"
 
-OUTPUT_DIR=$(mktemp -d "$V6/rl_480p_32gpu_newreward_$(date +%Y%m%d_%H%M%S)_XXXXXX")
+OUTPUT_DIR=$(mktemp -d "$V6/${RUN_PREFIX:-rl_480p_32gpu_newreward}_$(date +%Y%m%d_%H%M%S)_XXXXXX")
 export OUTPUT_DIR
 echo "本次训练目录 $OUTPUT_DIR"
 
@@ -35,4 +35,5 @@ bash "$SCRIPTS/run_minimax_h3_video_edit_v6_multinode.sh" \
   '++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.init_timeout=1800' \
   '++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.diffusion_offload_config={mode:layer,components:[dit,text_encoder],pin_memory:false}' \
   "++ray_kwargs.ray_init.runtime_env.env_vars.PATH=$FFBIN:\$PATH" \
+  "$@" \
   2>&1 | tee "$OUTPUT_DIR/train.log"

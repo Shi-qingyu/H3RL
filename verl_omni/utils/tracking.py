@@ -117,6 +117,40 @@ def _video_tensor_to_rgb24(video: torch.Tensor | MediaArtifact) -> tuple[np.ndar
     return frames, int(frames.shape[2]), int(frames.shape[1])
 
 
+def export_source_video_preview(
+    source: str, output_path: Path, *, width: int, height: int, frames: int, fps: float
+) -> None:
+    """Write a silent source clip aligned to the generated preview for visual comparison."""
+    from imageio_ffmpeg import get_ffmpeg_exe
+
+    # Hold the final source frame when the generated canvas includes temporal padding.
+    filters = f"fps={fps},scale={width}:{height}:flags=lanczos,setsar=1,tpad=stop_mode=clone:stop=-1"
+    temporary = _temp_path_beside(output_path, ".mp4")
+    try:
+        subprocess.run(
+            [
+                get_ffmpeg_exe(),
+                "-nostdin",
+                "-y",
+                "-loglevel", "error",
+                "-i", source,
+                "-map", "0:v:0",
+                "-an",
+                "-vf", filters,
+                "-frames:v", str(frames),
+                "-c:v", "libx264",
+                "-crf", "15",
+                "-pix_fmt", "yuv420p",
+                str(temporary),
+            ],
+            check=True,
+            timeout=_FFMPEG_TIMEOUT_S,
+        )
+        temporary.replace(output_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _export_video(
     output: torch.Tensor,
     output_path: str,

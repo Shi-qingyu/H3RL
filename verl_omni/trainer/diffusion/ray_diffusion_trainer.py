@@ -23,6 +23,7 @@ import subprocess
 import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
+from pathlib import Path
 from pprint import pprint
 from typing import Any, Literal, Optional
 
@@ -96,6 +97,7 @@ from verl_omni.utils.net_utils import worker_group_port_ranges
 from verl_omni.utils.tracking import (
     _export_video,
     batch_items,
+    export_source_video_preview,
     log_wandb_media,
     validate_audio_batch,
     wrap_val_samples_for_wandb,
@@ -257,6 +259,7 @@ def dump_generations(
     audio_sample_rates=None,
     media_kind=None,
     previews=None,
+    source_videos=None,
 ):
     """Dump samples to disk as media files plus a JSONL index.
 
@@ -367,6 +370,34 @@ def dump_generations(
     for k, v in reward_extra_infos_dict.items():
         if len(v) == n_full:
             base_data[k] = list(v)[:n]
+    if is_video and source_videos is not None:
+        saved_sources = {}
+        source_previews = []
+        source_errors = []
+        for i, source in enumerate(source_videos[:n]):
+            try:
+                if not isinstance(source, str) or not os.path.isabs(source):
+                    raise ValueError("Expected an absolute source_video path")
+                video = previews[i].data if previews is not None else outputs[i]
+                frames, _, height, width = video.shape
+                preview_fps = (previews[i].spec.fps if previews is not None else None) or fps
+                key = (source, width, height, frames, preview_fps)
+                if key not in saved_sources:
+                    path = Path(visual_folder) / f"{i}.source.mp4"
+                    export_source_video_preview(
+                        source, path, width=width, height=height, frames=frames, fps=preview_fps
+                    )
+                    saved_sources[key] = str(path)
+                source_previews.append(saved_sources[key])
+                source_errors.append(None)
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                sys_logger.warning("Source preview export failed at step %s sample %s: %s", global_steps, i, error)
+                source_previews.append(None)
+                source_errors.append(str(error))
+        base_data["source_video_original"] = list(source_videos[:n])
+        base_data["source_video"] = source_previews
+        if any(source_errors):
+            base_data["source_video_export_error"] = source_errors
     if any(video_export_errors):
         base_data["output_fallback"] = output_fallback_paths
         base_data["video_export_error"] = video_export_errors
@@ -581,6 +612,7 @@ class BaseRayDiffusionTrainer(ABC):
         audio_sample_rates=None,
         media_kind=None,
         previews=None,
+        source_videos=None,
     ):
         """Dump media with the shared exporter at the current training step."""
         return dump_generations(
@@ -597,6 +629,7 @@ class BaseRayDiffusionTrainer(ABC):
             audio_sample_rates=audio_sample_rates,
             media_kind=media_kind,
             previews=previews,
+            source_videos=source_videos,
         )
 
     def _log_rollout_data(
@@ -630,6 +663,11 @@ class BaseRayDiffusionTrainer(ABC):
             media_kind_values = _resolve_rollout_media_field(batch, tool_extra, "media_kind")
             media_kind = resolve_batch_media_kind(media_kind_values or [])
 
+            source_videos = None
+            if self.config.trainer.get("rollout_data_save_source_video", False):
+                source_videos = [
+                    (item.non_tensor_batch.get("extra_info") or {}).get("source_video") for item in batch
+                ]
             self._dump_generations(
                 inputs=inputs,
                 outputs=outputs,
@@ -643,6 +681,7 @@ class BaseRayDiffusionTrainer(ABC):
                 audio_sample_rates=audio_rates_to_dump,
                 media_kind=media_kind,
                 previews=previews_from_batch(batch),
+                source_videos=source_videos,
             )
 
     def _maybe_log_val_generations(

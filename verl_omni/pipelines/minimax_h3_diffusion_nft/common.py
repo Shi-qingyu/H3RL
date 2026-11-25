@@ -242,7 +242,7 @@ def h3_ulysses_forward(module: torch.nn.Module, model_inputs: dict[str, Any], sp
 
 @contextmanager
 def minimax_h3_short_video_requests() -> Iterator[None]:
-    """Allow positive-duration H3 outputs and short source clips during preprocessing."""
+    """Apply the rollout worker's source-video settings during H3 preprocessing."""
     from vllm_omni.model_executor.models.minimax_h3 import encoder_processing, reference_video
 
     # Upstream exposes the duration floor only as a module constant. Share the
@@ -250,11 +250,21 @@ def minimax_h3_short_video_requests() -> Iterator[None]:
     with _H3_REQUEST_PREPROCESSING_LOCK:
         original_min_seconds = encoder_processing.MINIMAX_H3_MIN_OUTPUT_SECONDS
         original_reference_min_seconds = reference_video.MINIMAX_H3_MIN_REFERENCE_DURATION
+        original_short_edge = reference_video.MINIMAX_H3_BASE_SHORT_EDGE
+        configured_edge = os.environ.get("H3_REFERENCE_VIDEO_SHORT_EDGE")
         try:
+            if configured_edge is not None:
+                short_edge = int(configured_edge)
+                if short_edge < 256 or short_edge > original_short_edge or short_edge % 32:
+                    raise ValueError(
+                        "H3_REFERENCE_VIDEO_SHORT_EDGE must be a multiple of 32 between 256 and the native short edge."
+                    )
+                reference_video.MINIMAX_H3_BASE_SHORT_EDGE = short_edge
             encoder_processing.MINIMAX_H3_MIN_OUTPUT_SECONDS = 1.0 / encoder_processing.MINIMAX_H3_FPS
             reference_video.MINIMAX_H3_MIN_REFERENCE_DURATION = 1.0 / encoder_processing.MINIMAX_H3_FPS
             yield
         finally:
+            reference_video.MINIMAX_H3_BASE_SHORT_EDGE = original_short_edge
             encoder_processing.MINIMAX_H3_MIN_OUTPUT_SECONDS = original_min_seconds
             reference_video.MINIMAX_H3_MIN_REFERENCE_DURATION = original_reference_min_seconds
 
